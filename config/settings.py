@@ -12,7 +12,7 @@ class Settings:
     TELEGRAM_WEBHOOK_URL: Optional[str] = os.getenv("TELEGRAM_WEBHOOK_URL")
     
     # Database Settings
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")   
     
     # AI Model Settings
     MODEL_NAME: str = os.getenv("MODEL_NAME", "meta-llama/Llama-2-7b-chat-hf")
@@ -32,6 +32,16 @@ class Settings:
     # Personalization Settings
     MIN_INTERACTIONS_FOR_PERSONALIZATION: int = int(os.getenv("MIN_INTERACTIONS_FOR_PERSONALIZATION", "5"))
     LEARNING_STYLE_UPDATE_INTERVAL: int = int(os.getenv("LEARNING_STYLE_UPDATE_INTERVAL", "24"))
+
+    # RAG Pipeline Settings
+    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "500"))  # words per chunk
+    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "50"))  # overlap words
+    TOP_K_RETRIEVAL: int = int(os.getenv("TOP_K_RETRIEVAL", "5"))  # chunks to retrieve
+    SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.3"))  # minimum similarity
+
+    # Document Processing Settings
+    SUPPORTED_FILE_TYPES: list = ["pdf", "docx", "txt", "doc"]
+    MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
     
     # Validation
     def validate(self) -> bool:

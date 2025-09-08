@@ -1,5 +1,5 @@
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 from src.data.models import User, UserInteraction, PersonalizationProfile
 from config.database import db_manager
 from config.settings import settings
+#For RAG functionality
+from src.core.rag_pipeline import RAGPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,9 @@ class StudyHelperBot:
     
     def __init__(self):
         self.application = None
+        self.rag_pipeline = None
         self._setup_application()
+        self._initialize_rag()
     
     def _setup_application(self):
         """Initialize the bot application"""
@@ -33,6 +37,16 @@ class StudyHelperBot:
         # Add handlers
         self._add_handlers()
         logger.info("Telegram bot application initialized")
+        
+    def _initialize_rag(self):
+        """Initialize the RAG pipeline"""
+        try:
+            self.rag_pipeline = RAGPipeline()
+            logger.info("RAG pipeline initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize RAG pipeline: {e}")
+            self.rag_pipeline = None
+    
     
     def _add_handlers(self):
         """Add all command and message handlers"""
@@ -147,7 +161,10 @@ Need more help? Just ask me anything!
                 user = session.query(User).filter(User.telegram_id == str(user_data.id)).first()
                 
                 if not user:
-                    await update.message.reply_text("Please use /start first to initialize your profile.")
+                    if update.message:
+                        await update.message.reply_text("Please use /start first to initialize your profile.")
+                    elif update.callback_query:
+                        await update.callback_query.edit_message_text("Please use /start first to initialize your profile.")
                     return
                 
                 # Get personalization profile
@@ -160,6 +177,13 @@ Need more help? Just ask me anything!
                     UserInteraction.user_id == user.id
                 ).count()
                 
+                # Handle null dates gracefully
+                member_since = user.created_at.strftime('%B %Y') if user.created_at else 'Date not recorded'
+                last_active = user.updated_at.strftime('%B %d, %Y') if user.updated_at else 'Date not recorded'
+                
+                # Handle null profile data
+                avg_session = f"{profile.avg_session_duration:.1f} minutes" if profile and profile.avg_session_duration is not None else 'Not recorded'
+                
                 profile_text = f"""
 👤 **Your Learning Profile**
 
@@ -170,21 +194,27 @@ Need more help? Just ask me anything!
 
 **Activity Stats:**
 • Total Interactions: {total_interactions}
-• Member Since: {user.created_at.strftime('%B %Y')}
-• Last Active: {user.updated_at.strftime('%B %d, %Y')}
+• Member Since: {member_since}
+• Last Active: {last_active}
 
 **Personalization:**
 • Status: {'Active' if profile and profile.total_interactions >= settings.MIN_INTERACTIONS_FOR_PERSONALIZATION else 'Learning your preferences...'}
-• Avg Session: {profile.avg_session_duration if profile else 0:.1f} minutes
+• Avg Session: {avg_session}
 
 Use /settings to customize your preferences!
                 """.strip()
                 
-                await update.message.reply_text(profile_text, parse_mode='Markdown')
+                if update.message:
+                    await update.message.reply_text(profile_text, parse_mode='Markdown')
+                elif update.callback_query:
+                    await update.callback_query.edit_message_text(profile_text, parse_mode='Markdown')
                 
         except Exception as e:
             logger.error(f"Error in profile_command: {e}")
-            await update.message.reply_text("Sorry, couldn't retrieve your profile. Please try again.")
+            if update.message:
+                await update.message.reply_text("Sorry, couldn't retrieve your profile. Please try again.")
+            elif update.callback_query:
+                await update.callback_query.edit_message_text("Sorry, couldn't retrieve your profile. Please try again.")
     
     async def courses_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /courses command"""
@@ -261,7 +291,8 @@ Choose a setting to modify:
                 
                 # For now, provide a simple response since we haven't implemented RAG yet
                 # This will be replaced with actual AI processing later
-                response_text = await self._process_query_basic(query_text, user)
+                #response_text = await self._process_query_basic(query_text, user)
+                response_text = await self._process_query_rag_enhanced(query_text, user)
                 
                 # Send response
                 await update.message.reply_text(response_text, parse_mode='Markdown')
@@ -281,8 +312,11 @@ Choose a setting to modify:
                 )
                 
                 # Log interaction
+                #self._log_interaction(
+                #   session, user.id, query_text, response_text, "question"
+                #)
                 self._log_interaction(
-                    session, user.id, query_text, response_text, "question"
+                    session, user.id, query_text, response_text, "rag_query"
                 )
                 
         except Exception as e:
@@ -329,6 +363,93 @@ Choose a setting to modify:
         except Exception as e:
             logger.error(f"Error in handle_callback: {e}")
             await query.edit_message_text("Sorry, something went wrong. Please try again.")
+
+
+    
+    async def _process_query_rag_enhanced(self, query: str, user: User) -> str:
+        """Enhanced query processing with RAG pipeline"""
+        if not self.rag_pipeline:
+            logger.error("RAG pipeline not initialized")
+            return await self._process_query_basic(query, user)  # Fallback to basic
+        
+        try:
+            # Determine course context from query
+            course_id = self._extract_course_context(query, user)
+            
+            # Generate context using RAG
+            rag_context = self.rag_pipeline.generate_context(query, course_id)
+            
+            if rag_context['has_relevant_content']:
+                response = await self._generate_rag_response(query, rag_context, user)
+            else:
+                response = await self._generate_fallback_response(query, user)
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error in RAG-enhanced processing: {e}")
+            return await self._process_query_basic(query, user)
+
+    def _extract_course_context(self, query: str, user: User) -> Optional[int]:
+        """Extract course context from query (simple keyword matching for now)"""
+        query_lower = query.lower()
+        
+        # Simple course code detection
+        course_keywords = {
+            'ics201': 1,  # Assuming course ID 1 for ICS201
+            'ics301': 2,  # Assuming course ID 2 for ICS301  
+            'mat201': 3,  # Assuming course ID 3 for MAT201
+            'data structures': 1,
+            'software engineering': 2,
+            'discrete mathematics': 3
+        }
+        
+        for keyword, course_id in course_keywords.items():
+            if keyword in query_lower:
+                return course_id
+        
+        return None
+
+    async def _generate_rag_response(self, query: str, rag_context: Dict[str, Any], user: User) -> str:
+        """Generate response using RAG context"""
+        context = rag_context['context']
+        sources = rag_context['sources']
+        
+        # For now, create a structured response based on retrieved context
+        # Later, you'll replace this with actual LLaMA generation
+        
+        response_parts = []
+        
+        # Add main response based on context
+        if any(word in query.lower() for word in ['what is', 'define', 'explain']):
+            response_parts.append(f"Based on your course materials:\n\n{context[:800]}...")
+        else:
+            response_parts.append(f"Here's what I found in your course materials:\n\n{context[:600]}...")
+        
+        # Add sources
+        if sources:
+            response_parts.append("\n**Sources:**")
+            for i, source in enumerate(sources[:3], 1):
+                score_percent = int(source['similarity_score'] * 100)
+                response_parts.append(f"{i}. {source['title']} ({source['course_code']}) - {score_percent}% match")
+        
+        # Add personalized note
+        response_parts.append(f"\n*This response is tailored for your {user.learning_style} learning style.*")
+        
+        return "\n".join(response_parts)
+
+    async def _generate_fallback_response(self, query: str, user: User) -> str:
+        """Generate fallback response when no relevant content found"""
+        return f"""I couldn't find specific information about "{query}" in your uploaded course materials.
+
+**Suggestions:**
+• Try asking about topics from your enrolled courses (ICS 201, ICS 301, MAT 201)
+• Check if your instructors have uploaded relevant materials to the LMS
+• Use more specific keywords related to your coursework
+
+I'm continuously learning from new materials as they're added to your courses. Try asking again later!
+
+*Use /help for tips on asking better questions.*"""
     
     async def _process_query_basic(self, query: str, user: User) -> str:
         """Basic query processing - will be replaced with RAG pipeline later"""

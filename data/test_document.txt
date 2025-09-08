@@ -1,0 +1,27 @@
+
+    Data Structures and Algorithms - Week 1 Notes
+    
+    Stack Data Structure:
+    A stack is a linear data structure that follows the Last In First Out (LIFO) principle.
+    Elements are added and removed from the same end, called the top of the stack.
+    
+    Main operations:
+    - Push: Add an element to the top of the stack
+    - Pop: Remove and return the top element
+    - Peek/Top: Return the top element without removing it
+    - isEmpty: Check if the stack is empty
+    
+    Queue Data Structure:
+    A queue is a linear data structure that follows the First In First Out (FIFO) principle.
+    Elements are added at the rear and removed from the front.
+    
+    Main operations:
+    - Enqueue: Add an element to the rear of the queue
+    - Dequeue: Remove and return the front element
+    - Front: Return the front element without removing it
+    - isEmpty: Check if the queue is empty
+    
+    Applications:
+    Stacks are used in function calls, expression evaluation, and undo operations.
+    Queues are used in scheduling, breadth-first search, and handling requests.
+    
