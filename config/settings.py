@@ -21,7 +21,11 @@ class Settings:
     MAX_CONTEXT_LENGTH: int = int(os.getenv("MAX_CONTEXT_LENGTH", "4096"))
     
     # LMS Settings
+    MOODLE_BASE_URL: Optional[str] = os.getenv("MOODLE_BASE_URL")
+    MOODLE_API_TOKEN: Optional[str] = os.getenv("MOODLE_API_TOKEN")
     GOOGLE_CLASSROOM_CREDENTIALS: Optional[str] = os.getenv("GOOGLE_CLASSROOM_CREDENTIALS")
+    PER_USER_GOOGLE_OAUTH: bool = os.getenv("PER_USER_GOOGLE_OAUTH", "True").lower() == "true"
+    OAUTH_REDIRECT_URI: Optional[str] = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:8080/oauth/callback")
     
     # Application Settings
     DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
@@ -42,12 +46,31 @@ class Settings:
     # Document Processing Settings
     SUPPORTED_FILE_TYPES: list = ["pdf", "docx", "txt", "doc"]
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
+
+    # Scheduler Settings
+    LMS_SYNC_INTERVAL_MINUTES: int = int(os.getenv("LMS_SYNC_INTERVAL_MINUTES", "30"))
+    DOCUMENT_PROCESSING_INTERVAL_MINUTES: int = int(os.getenv("DOCUMENT_PROCESSING_INTERVAL_MINUTES", "10"))
+    ENABLE_NOTIFICATIONS: bool = os.getenv("ENABLE_NOTIFICATIONS", "True").lower() == "true"
+    
+    # API Rate Limiting
+    MOODLE_API_RATE_LIMIT: int = int(os.getenv("MOODLE_API_RATE_LIMIT", "100"))  # requests per hour
+    GOOGLE_API_RATE_LIMIT: int = int(os.getenv("GOOGLE_API_RATE_LIMIT", "1000"))
     
     # Validation
     def validate(self) -> bool:
         """Validate required settings"""
         if not self.TELEGRAM_BOT_TOKEN:
             raise ValueError("TELEGRAM_BOT_TOKEN is required")
+        if not self.DATABASE_URL:
+            raise ValueError("DATABASE_URL is required")
+        
+        # Check if at least one LMS is configured
+        has_moodle = self.MOODLE_BASE_URL and self.MOODLE_API_TOKEN
+        has_google_classroom = self.GOOGLE_CLASSROOM_CREDENTIALS
+        
+        if not (has_moodle or has_google_classroom):
+            raise ValueError("At least one LMS must be configured (Moodle or Google Classroom)")
+        
         return True
 
 # Global settings instance

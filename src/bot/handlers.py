@@ -18,6 +18,11 @@ from config.database import db_manager
 from config.settings import settings
 #For RAG functionality
 from src.core.rag_pipeline import RAGPipeline
+#For LMS integration functionality
+from src.services.scheduler import scheduler_service
+from src.services.lms_integration import lms_service
+from src.bot import commands as bot_commands
+from src.data.models import User, UserInteraction, PersonalizationProfile, Course, Document, CourseEnrollment
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +34,7 @@ class StudyHelperBot:
         self.rag_pipeline = None
         self._setup_application()
         self._initialize_rag()
+        self._start_notification_handler()
     
     def _setup_application(self):
         """Initialize the bot application"""
@@ -46,7 +52,42 @@ class StudyHelperBot:
         except Exception as e:
             logger.error(f"Failed to initialize RAG pipeline: {e}")
             self.rag_pipeline = None
+
+    def _start_notification_handler(self):
+        """Start the notification handler job"""
+        try:
+            # Schedule notification checks every minute
+            job_queue = self.application.job_queue
+            if job_queue:
+                job_queue.run_repeating(
+                    self._process_notifications, 
+                    interval=60,  # Check every minute
+                    first=10  # Start after 10 seconds
+                )
+                logger.info("Notification handler started")
+        except Exception as e:
+            logger.error(f"Failed to start notification handler: {e}")
     
+    async def _process_notifications(self, context: ContextTypes.DEFAULT_TYPE):
+        """Process pending notifications from scheduler"""
+        try:
+            notifications = scheduler_service.get_pending_notifications()
+            
+            for notification in notifications:
+                try:
+                    await context.bot.send_message(
+                        chat_id=notification['user_telegram_id'],
+                        text=notification['message'],
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"Sent notification to user {notification['user_telegram_id']}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to send notification to {notification['user_telegram_id']}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error processing notifications: {e}")
+        
     
     def _add_handlers(self):
         """Add all command and message handlers"""
@@ -56,7 +97,16 @@ class StudyHelperBot:
         self.application.add_handler(CommandHandler("profile", self.profile_command))
         self.application.add_handler(CommandHandler("courses", self.courses_command))
         self.application.add_handler(CommandHandler("settings", self.settings_command))
-        
+
+        # Classroom related
+        self.application.add_handler(CommandHandler("connect_classroom", self.connect_classroom_command))
+        self.application.add_handler(CommandHandler("disconnect_classroom", self.disconnect_classroom_command))
+        self.application.add_handler(CommandHandler("connections", self.connection_status_command))
+    
+        # Admin/Debug commands
+        self.application.add_handler(CommandHandler("sync", self.sync_command))
+        self.application.add_handler(CommandHandler("status", self.status_command))
+                
         # Message handlers
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_query))
         
@@ -67,215 +117,54 @@ class StudyHelperBot:
         self.application.add_error_handler(self.error_handler)
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        user_data = update.effective_user
-        
-        try:
-            # Get or create user in database
-            with db_manager.get_session() as session:
-                user = self._get_or_create_user(session, user_data)
-                
-                # Create welcome message
-                welcome_text = f"""
-🎓 Welcome to Study Helper Agent, {user.first_name}!
-
-I'm your AI-powered academic assistant. I can help you with:
-• 📚 Answering questions about your course materials
-• 📋 Tracking assignments and deadlines  
-• 🔔 Getting notified about new content
-• 📈 Personalizing your learning experience
-
-To get started:
-1. Use /courses to see available courses
-2. Ask me questions about your studies
-3. Use /help for more commands
-
-Example: "What are the main topics in today's lecture notes?"
-                """.strip()
-                
-                # Create inline keyboard for quick actions
-                keyboard = [
-                    [
-                        InlineKeyboardButton("📚 View Courses", callback_data="view_courses"),
-                        InlineKeyboardButton("⚙️ Settings", callback_data="settings")
-                    ],
-                    [
-                        InlineKeyboardButton("❓ Help", callback_data="help"),
-                        InlineKeyboardButton("👤 Profile", callback_data="profile")
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await update.message.reply_text(welcome_text, reply_markup=reply_markup)
-                
-                # Log interaction
-                self._log_interaction(
-                    session, user.id, "/start", welcome_text, "command"
-                )
-                
-        except Exception as e:
-            logger.error(f"Error in start_command: {e}")
-            await update.message.reply_text(
-                "Sorry, I encountered an error. Please try again later."
-            )
+        """Handle /start command (delegates to bot_commands)"""
+        await bot_commands.start_command(update, context)
     
+    async def sync_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /sync command for manual synchronization (delegates)"""
+        await bot_commands.sync_command(update, context)
+    
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /status command (delegates)"""
+        await bot_commands.status_command(update, context)
+    
+
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command"""
-        help_text = """
-🆘 **Study Helper Agent Commands**
-
-**Basic Commands:**
-/start - Initialize the bot and see welcome message
-/help - Show this help message
-/profile - View your learning profile
-/courses - View enrolled courses
-/settings - Adjust your preferences
-
-**How to Use:**
-📝 **Ask Questions**: Just type your question naturally
-   Example: "Explain the concept of inheritance in OOP"
-
-🔍 **Search Content**: Ask about specific topics
-   Example: "What did the professor say about databases?"
-
-📊 **Get Summaries**: Request summaries of materials
-   Example: "Summarize today's lecture on algorithms"
-
-**Tips for Better Results:**
-• Be specific about which course or topic
-• Ask follow-up questions for clarification
-• Rate my responses to improve personalization
-• Use /settings to customize your experience
-
-Need more help? Just ask me anything!
-        """.strip()
-        
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        """Handle /help command (delegates)"""
+        await bot_commands.help_command(update, context)
     
     async def profile_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /profile command"""
-        user_data = update.effective_user
-        
-        try:
-            with db_manager.get_session() as session:
-                user = session.query(User).filter(User.telegram_id == str(user_data.id)).first()
-                
-                if not user:
-                    if update.message:
-                        await update.message.reply_text("Please use /start first to initialize your profile.")
-                    elif update.callback_query:
-                        await update.callback_query.edit_message_text("Please use /start first to initialize your profile.")
-                    return
-                
-                # Get personalization profile
-                profile = session.query(PersonalizationProfile).filter(
-                    PersonalizationProfile.user_id == user.id
-                ).first()
-                
-                # Calculate some basic stats
-                total_interactions = session.query(UserInteraction).filter(
-                    UserInteraction.user_id == user.id
-                ).count()
-                
-                # Handle null dates gracefully
-                member_since = user.created_at.strftime('%B %Y') if user.created_at else 'Date not recorded'
-                last_active = user.updated_at.strftime('%B %d, %Y') if user.updated_at else 'Date not recorded'
-                
-                # Handle null profile data
-                avg_session = f"{profile.avg_session_duration:.1f} minutes" if profile and profile.avg_session_duration is not None else 'Not recorded'
-                
-                profile_text = f"""
-👤 **Your Learning Profile**
-
-**Basic Info:**
-• Name: {user.first_name} {user.last_name or ''}
-• Learning Style: {user.learning_style.title()}
-• Preferred Difficulty: {user.difficulty_preference.title()}
-
-**Activity Stats:**
-• Total Interactions: {total_interactions}
-• Member Since: {member_since}
-• Last Active: {last_active}
-
-**Personalization:**
-• Status: {'Active' if profile and profile.total_interactions >= settings.MIN_INTERACTIONS_FOR_PERSONALIZATION else 'Learning your preferences...'}
-• Avg Session: {avg_session}
-
-Use /settings to customize your preferences!
-                """.strip()
-                
-                if update.message:
-                    await update.message.reply_text(profile_text, parse_mode='Markdown')
-                elif update.callback_query:
-                    await update.callback_query.edit_message_text(profile_text, parse_mode='Markdown')
-                
-        except Exception as e:
-            logger.error(f"Error in profile_command: {e}")
-            if update.message:
-                await update.message.reply_text("Sorry, couldn't retrieve your profile. Please try again.")
-            elif update.callback_query:
-                await update.callback_query.edit_message_text("Sorry, couldn't retrieve your profile. Please try again.")
+        """Handle /profile command (delegates)"""
+        await bot_commands.profile_command(update, context)
     
     async def courses_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /courses command"""
-        # For now, this shows mock courses since we haven't implemented LMS integration yet
-        courses_text = """
-📚 **Your Enrolled Courses**
+        """Handle /courses command (delegates)"""
+        await bot_commands.courses_command(update, context)
 
-*Currently showing mock data - LMS integration coming soon!*
+    async def _courses_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        return await bot_commands.courses_command(
+            update,
+            context,
+            get_user_by_telegram_id=self._get_user_by_telegram_id,
+            log_interaction=self._log_interaction
+        )
+ 
+    async def connect_classroom_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /connect_classroom command (delegates)"""
+        await bot_commands.connect_classroom_command(update, context)
 
-🖥️ **ICS 201 - Data Structures**
-   • Status: Active
-   • New materials: 2 documents
+    async def disconnect_classroom_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /disconnect_classroom command (delegates)"""
+        await bot_commands.disconnect_classroom_command(update, context)
 
-💻 **ICS 301 - Software Engineering** 
-   • Status: Active  
-   • New materials: 1 assignment
+    async def connection_status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /connections command to show LMS connection status (delegates)"""
+        await bot_commands.connection_status_command(update, context)
 
-🧮 **MAT 201 - Discrete Mathematics**
-   • Status: Active
-   • New materials: 3 lecture notes
-
-To ask course-specific questions, mention the course:
-"What are stacks in ICS 201?"
-        """.strip()
-        
-        keyboard = [
-            [InlineKeyboardButton("🔔 Enable Notifications", callback_data="enable_notifications")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(courses_text, reply_markup=reply_markup, parse_mode='Markdown')
     
     async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /settings command"""
-        keyboard = [
-            [
-                InlineKeyboardButton("📖 Learning Style", callback_data="setting_learning_style"),
-                InlineKeyboardButton("📊 Difficulty", callback_data="setting_difficulty")
-            ],
-            [
-                InlineKeyboardButton("🔔 Notifications", callback_data="setting_notifications"),
-                InlineKeyboardButton("📱 Response Length", callback_data="setting_response_length")
-            ],
-            [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        settings_text = """
-⚙️ **Settings & Preferences**
-
-Customize your Study Helper Agent experience:
-
-• **Learning Style**: How you prefer to learn (visual, auditory, etc.)
-• **Difficulty Level**: Complexity of explanations you prefer  
-• **Notifications**: When to receive updates about new content
-• **Response Length**: How detailed you want my responses
-
-Choose a setting to modify:
-        """.strip()
-        
-        await update.message.reply_text(settings_text, reply_markup=reply_markup, parse_mode='Markdown')
+        """Handle /settings command (delegates)"""
+        await bot_commands.settings_command(update, context)
     
     async def handle_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle general text queries - main AI interaction"""
@@ -330,12 +219,78 @@ Choose a setting to modify:
         query = update.callback_query
         await query.answer()  # Acknowledge the callback
         
-        callback_data = query.data
+        callback_data = query.data  
         
         try:
             if callback_data == "view_courses":
-                await self.courses_command(update, context)
+                #await self.courses_command(update, context)
+                user_data = query.from_user
             
+                with db_manager.get_session() as session:
+                    user = session.query(User).filter(User.telegram_id == str(user_data.id)).first()
+                    
+                    if not user:
+                        await query.edit_message_text("Please use /start first to create your profile.")
+                        return
+                    
+                    # Simple courses display for now
+                    await query.edit_message_text("📚 **Your Courses**\n\nFetching course information...")
+                
+
+            elif callback_data == "sync_now":
+                await query.edit_message_text("🔄 Starting sync...")
+                try:
+                    result = scheduler_service.force_sync_now()
+                    if result.get('success'):
+                        stats = result.get('stats', {})
+                        message = f"✅ Sync completed!\nCourses: {stats.get('courses_synced', 0)}, Documents: {stats.get('documents_synced', 0)}"
+                    else:
+                        message = f"❌ Sync failed: {result.get('error', 'Unknown error')}"
+                    await query.edit_message_text(message)
+                except Exception as sync_error:
+                    logger.error(f"Sync error: {sync_error}")
+                    await query.edit_message_text("❌ Sync failed due to internal error.")
+            
+            #oauth callbacks
+            elif callback_data == "confirm_disconnect_gc":
+                user_data = update.effective_user
+                
+                with db_manager.get_session() as session:
+                    user = session.query(User).filter(
+                        User.telegram_id == str(user_data.id)
+                    ).first()
+                    
+                    if user:
+                        # Clear credentials
+                        user.google_credentials = None
+                        user.google_classroom_connected = False
+                        session.commit()
+                        
+                        await query.edit_message_text(
+                            "Google Classroom has been disconnected successfully.\n\n"
+                            "Use /connect_classroom to reconnect anytime."
+                        )
+                    else:
+                        await query.edit_message_text("User not found.")
+            
+            elif callback_data == "cancel_disconnect":
+                await query.edit_message_text("Disconnection cancelled.")
+            
+            elif callback_data == "status":
+                #await self.status_command(update, context)
+                try:
+                    status = scheduler_service.get_sync_status()
+                    status_text = f"📊 **System Status**\n\n**Scheduler:** {'🟢 Running' if status.get('running') else '🔴 Stopped'}\n**Documents:** {status.get('documents', {}).get('total', 0)} total"
+                    await query.edit_message_text(status_text, parse_mode='Markdown')
+                except Exception as status_error:
+                    logger.error(f"Status error: {status_error}")
+                    await query.edit_message_text("❌ Failed to get system status.")
+            
+            elif callback_data == "sync_courses":
+                await query.edit_message_text("🔄 Refreshing courses...")
+                result = scheduler_service.force_sync_now()
+                await query.edit_message_text("✅ Courses refreshed! Use /courses to see updated list.")
+                    
             elif callback_data == "settings":
                 await self.settings_command(update, context)
             
@@ -358,11 +313,11 @@ Choose a setting to modify:
                 )
             
             else:
-                await query.edit_message_text("Feature coming soon!")
+                await query.edit_message_text("Feature coming soon! Though sifai kujibu hivi mkuu. \n\n Kwa handle_callback")
                 
         except Exception as e:
             logger.error(f"Error in handle_callback: {e}")
-            await query.edit_message_text("Sorry, something went wrong. Please try again.")
+            await query.edit_message_text("Sorry, something went wrong. Please try again. \n\n Kwa handle_callback superior")
 
 
     
