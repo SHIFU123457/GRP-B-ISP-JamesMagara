@@ -24,6 +24,12 @@ def create_sample_data():
     print("Creating sample data...")
     
     with db_manager.get_session() as session:
+        # Check if courses already exist
+        existing_courses = session.query(Course).count()
+        if existing_courses > 0:
+            print(f"Found {existing_courses} existing courses. Skipping sample data creation.")
+            return
+        
         # Create sample courses
         courses = [
             Course(
@@ -32,6 +38,7 @@ def create_sample_data():
                 description="Introduction to data structures, algorithms, and their analysis",
                 semester="1.2",
                 year=2025,
+                is_public=False,
                 lms_platform="moodle"
             ),
             Course(
@@ -40,6 +47,7 @@ def create_sample_data():
                 description="Software development methodologies, design patterns, and project management",
                 semester="3.1",
                 year=2025,
+                is_public=False,
                 lms_platform="moodle"
             ),
             Course(
@@ -48,6 +56,7 @@ def create_sample_data():
                 description="Mathematical foundations for computer science",
                 semester="1.1",
                 year=2025,
+                is_public=False,
                 lms_platform="google_classroom"
             )
         ]
@@ -103,6 +112,11 @@ def setup_database():
         print("Creating database tables...")
         db_manager.create_tables()
         print("✅ Database tables created successfully")
+        
+        # Migrate schema (add missing columns and create new tables)
+        print("Migrating database schema...")
+        db_manager.migrate_schema()
+        print("✅ Database schema migrated successfully")
         
         # Create sample data
         create_sample_data()
