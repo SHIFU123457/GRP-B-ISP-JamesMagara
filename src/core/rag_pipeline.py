@@ -7,13 +7,38 @@ import numpy as np
 from pathlib import Path
 import json
 import uuid
+from typing import Union
+from functools import wraps
+import time
 
 from config.settings import settings
 from config.database import db_manager
 from src.data.models import Document, DocumentEmbedding
 from src.services.document_processor import DocumentProcessor
+from src.services.llm_integration import LLMService
 
 logger = logging.getLogger(__name__)
+
+def retry_with_backoff(max_retries: int = 3, base_delay: float = 1.0):
+    """Decorator for retrying operations with exponential backoff"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"Attempt {attempt + 1} failed for {func.__name__}: {e}. Retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"All {max_retries} attempts failed for {func.__name__}: {e}")
+            raise last_exception
+        return wrapper
+    return decorator
 
 class RAGPipeline:
     """Retrieval-Augmented Generation pipeline for semantic document search"""
@@ -27,11 +52,12 @@ class RAGPipeline:
         self.vector_store = None
         self.collection = None
         self.document_processor = DocumentProcessor()
+        self.llm_service = None
         
         self._initialize_components()
     
     def _initialize_components(self):
-        """Initialize embedding model and vector store"""
+        """Initialize embedding model, vector store and llm service"""
         try:
             # Initialize embedding model
             logger.info(f"Loading embedding model: {self.embedding_model_name}")
@@ -58,12 +84,17 @@ class RAGPipeline:
                 metadata={"description": "Academic documents for Study Helper Agent"}
             )
             
-            logger.info("RAG pipeline initialized successfully")
+            # Initialize LLM service
+            logger.info("Initializing LLM service...")
+            self.llm_service = LLMService()
+            
+            logger.info("RAG pipeline initialized successfully with LLM integration")
             
         except Exception as e:
             logger.error(f"Failed to initialize RAG pipeline: {e}")
             raise
     
+    @retry_with_backoff(max_retries=3, base_delay=2.0)
     def process_and_store_document(self, document_id: int) -> bool:
         """Process a document and store its embeddings"""
         try:
@@ -117,6 +148,7 @@ class RAGPipeline:
             logger.error(f"Error processing document {document_id}: {e}")
             return False
     
+    @retry_with_backoff(max_retries=2, base_delay=1.0)
     def _store_chunk_embedding(self, chunk: Dict[str, Any], document_id: int, session) -> bool:
         """Store a single chunk embedding"""
         try:
@@ -150,6 +182,7 @@ class RAGPipeline:
             logger.error(f"Error storing chunk embedding: {e}")
             return False
     
+    @retry_with_backoff(max_retries=2, base_delay=0.5)
     def retrieve_relevant_chunks(self, query: str, course_id: Optional[int] = None, top_k: int = 5) -> List[Dict[str, Any]]:
         """Retrieve most relevant chunks for a given query"""
         try:
@@ -177,12 +210,14 @@ class RAGPipeline:
                     results['metadatas'][0], 
                     results['distances'][0]
                 )):
-                    relevant_chunks.append({
-                        'text': doc,
-                        'metadata': metadata,
-                        'similarity_score': 1 - distance,  # Convert distance to similarity
-                        'rank': i + 1
-                    })
+                    similarity_score = 1 - distance
+                    if similarity_score >= settings.SIMILARITY_THRESHOLD:
+                        relevant_chunks.append({
+                            'text': doc,
+                            'metadata': metadata,
+                            'similarity_score': similarity_score,
+                            'rank': i + 1
+                        })
             
             logger.info(f"Retrieved {len(relevant_chunks)} relevant chunks for query: {query[:50]}...")
             return relevant_chunks
@@ -243,7 +278,65 @@ class RAGPipeline:
                 'sources': [],
                 'has_relevant_content': False
             }
+   
+    def generate_rag_response(self, query: str, course_id: Optional[int] = None, user_preferences: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Generate complete RAG response using LLM with retrieved context"""
+        try:
+            # Generate context from relevant documents
+            context_data = self.generate_context(query, course_id)
+            
+            if not context_data['has_relevant_content']:
+                # No relevant content found, let LLM handle it
+                response = self.llm_service.generate_response(query, "", user_preferences)
+                return {
+                    'response': response,
+                    'context_used': False,
+                    'sources': [],
+                    'confidence': 'low'
+                }
+            
+            # Generate response using LLM with context
+            response = self.llm_service.generate_response(
+                query, 
+                context_data['context'], 
+                user_preferences
+            )
+            
+            return {
+                'response': response,
+                'context_used': True,
+                'sources': context_data['sources'],
+                'chunks_retrieved': context_data['total_chunks'],
+                'chunks_used': context_data['used_chunks'],
+                'confidence': self._assess_response_confidence(context_data['sources'])
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generating RAG response: {e}")
+            # Fallback to basic LLM response
+            fallback_response = self.llm_service.generate_response(query, "", user_preferences)
+            return {
+                'response': fallback_response,
+                'context_used': False,
+                'sources': [],
+                'confidence': 'low',
+                'error': str(e)
+            }
     
+    def _assess_response_confidence(self, sources: List[Dict[str, Any]]) -> str:
+        """Assess confidence level based on source quality"""
+        if not sources:
+            return 'low'
+        
+        avg_similarity = sum(source['similarity_score'] for source in sources) / len(sources)
+        
+        if avg_similarity >= 0.8:
+            return 'high'
+        elif avg_similarity >= 0.6:
+            return 'medium'
+        else:
+            return 'low'
+        
     def get_vector_store_stats(self) -> Dict[str, Any]:
         """Get statistics about the vector store"""
         try:
@@ -257,7 +350,8 @@ class RAGPipeline:
                 'total_embeddings': count,
                 'processed_documents': processed_docs,
                 'total_documents': total_docs,
-                'processing_rate': f"{(processed_docs/total_docs*100):.1f}%" if total_docs > 0 else "0%"
+                'processing_rate': f"{(processed_docs/total_docs*100):.1f}%" if total_docs > 0 else "0%",
+                'llm_service_available': self.llm_service is not None
             }
             
         except Exception as e:
@@ -266,5 +360,6 @@ class RAGPipeline:
                 'total_embeddings': 0,
                 'processed_documents': 0,
                 'total_documents': 0,
-                'processing_rate': "0%"
+                'processing_rate': "0%",
+                'llm_service_available': False
             }
