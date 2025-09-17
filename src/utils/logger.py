@@ -1,6 +1,7 @@
 import logging
 import logging.config
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -8,7 +9,18 @@ from config.settings import settings
 
 def setup_logging():
     """Setup logging configuration"""
-    
+
+    # Ensure UTF-8 encoding for stdout/stderr on Windows
+    if sys.platform == 'win32':
+        import locale
+        if sys.stdout.encoding != 'utf-8':
+            try:
+                sys.stdout.reconfigure(encoding='utf-8')
+                sys.stderr.reconfigure(encoding='utf-8')
+            except (AttributeError, OSError):
+                # Fallback for older Python versions or if reconfigure fails
+                pass
+
     # Create logs directory if it doesn't exist
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
@@ -34,6 +46,7 @@ def setup_logging():
                 'level': settings.LOG_LEVEL,
                 'class': 'logging.StreamHandler',
                 'formatter': 'standard',
+                'stream': 'ext://sys.stdout',
             },
             'file': {
                 'level': 'INFO',
@@ -42,6 +55,7 @@ def setup_logging():
                 'maxBytes': 10485760,  # 10MB
                 'backupCount': 5,
                 'formatter': 'detailed',
+                'encoding': 'utf-8',
             },
             'error_file': {
                 'level': 'ERROR',
@@ -50,6 +64,7 @@ def setup_logging():
                 'maxBytes': 10485760,  # 10MB
                 'backupCount': 3,
                 'formatter': 'detailed',
+                'encoding': 'utf-8',
             },
         },
         'loggers': {

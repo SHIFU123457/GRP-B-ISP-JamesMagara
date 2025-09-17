@@ -1,12 +1,14 @@
 import asyncio
 import logging
 import sys
+import signal
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 # Add project root directory to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from bot.handlers import StudyHelperBot
+from src.bot.handlers import StudyHelperBot
 from config.database import db_manager
 from config.settings import settings
 from utils.logger import setup_logging
@@ -52,62 +54,131 @@ def test_database_connection():
         logger.error(f"Database connection failed: {e}")
         return False
 
-def main():
-    """Main application function"""
-    # Setup logging
-    setup_logging()
+def setup_signal_handlers(bot, scheduler_service):
+    """Setup signal handlers for graceful shutdown"""
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
+        try:
+            if scheduler_service:
+                scheduler_service.stop()
+                logger.info("Scheduler stopped")
+        except Exception as e:
+            logger.error(f"Error stopping scheduler: {e}")
+
+        try:
+            if bot:
+                bot.stop()
+                logger.info("Bot stopped")
+        except Exception as e:
+            logger.error(f"Error stopping bot: {e}")
+
+        logger.info("Graceful shutdown completed")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+def validate_environment():
+    """Validate environment and configuration"""
     logger = logging.getLogger(__name__)
-    
-    logger.info("Starting Study Helper Agent...")
-    logger.info(f"Environment: {settings.ENVIRONMENT}")
-    logger.info(f"Debug mode: {settings.DEBUG}")
-    
-    #test db connectivity
-    if not test_database_connection():
-        logger.error("Database connection failed. Check your database settings.")
-        sys.exit(1)
 
-    # Initialize database
-    if not initialize_database():
-        logger.error("Failed to initialize database. Exiting.")
-        sys.exit(1)
+    # Check critical environment variables
+    if not settings.TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not configured")
+        return False
 
-    # Initialize LMS integration
-    lms_initialized = initialize_lms_integration()
-    if not lms_initialized:
-        logger.warning("LMS integration failed - continuing without LMS features")
-    
-    # Initialize and start scheduler
+    if not settings.DATABASE_URL:
+        logger.error("DATABASE_URL not configured")
+        return False
+
+    # Check vector store directory
+    vector_store_path = Path(settings.VECTOR_STORE_PATH)
     try:
-        if lms_initialized:
-            scheduler_service.start()
-            logger.info("Scheduler service started")
-        else:
-            logger.info("Scheduler not started due to LMS initialization failure")
+        vector_store_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Vector store directory ready: {vector_store_path}")
     except Exception as e:
-        logger.error(f"Failed to start scheduler: {e}")
-    
-    
-    # Initialize and start bot
+        logger.error(f"Cannot create vector store directory: {e}")
+        return False
+
+    logger.info("✅ Environment validation passed")
+    return True
+
+def main():
+    """Main application function with improved error handling"""
+    bot = None
+
     try:
+        # Setup logging
+        setup_logging()
+        logger = logging.getLogger(__name__)
+
+        logger.info("🚀 Starting Study Helper Agent...")
+        logger.info(f"Environment: {settings.ENVIRONMENT}")
+        logger.info(f"Debug mode: {settings.DEBUG}")
+
+        # Validate environment
+        if not validate_environment():
+            logger.error("❌ Environment validation failed. Exiting.")
+            sys.exit(1)
+
+        # Test db connectivity
+        if not test_database_connection():
+            logger.error("Database connection failed. Check your database settings.")
+            sys.exit(1)
+
+        # Initialize database
+        if not initialize_database():
+            logger.error("Failed to initialize database. Exiting.")
+            sys.exit(1)
+
+        # Initialize LMS integration
+        lms_initialized = initialize_lms_integration()
+        if not lms_initialized:
+            logger.warning("LMS integration failed - continuing without LMS features")
+
+        # Initialize and start scheduler
+        try:
+            if lms_initialized:
+                scheduler_service.start()
+                logger.info("Scheduler service started")
+            else:
+                logger.info("Scheduler not started due to LMS initialization failure")
+        except Exception as e:
+            logger.error(f"Failed to start scheduler: {e}")
+
+        # Initialize and start bot
         bot = StudyHelperBot()
-        logger.info("Bot initialized successfully")
-        
+        logger.info("✅ Bot initialized successfully")
+
+        # Setup signal handlers for graceful shutdown
+        setup_signal_handlers(bot, scheduler_service)
+
         # Start the bot
+        logger.info("🎆 Study Helper Agent is now running!")
         bot.run()
-        
+
     except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt. Shutting down...")
+        logger.info("❌ Received keyboard interrupt. Shutting down...")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"❌ Unexpected error in main: {e}", exc_info=True)
         sys.exit(1)
     finally:
+        logger.info("💯 Performing cleanup...")
         try:
-            scheduler_service.stop()
-            logger.info("Scheduler stopped")
-        except:
-            pass
-        logger.info("Study Helper Agent stopped")
+            if scheduler_service:
+                scheduler_service.stop()
+                logger.info("✅ Scheduler stopped")
+        except Exception as e:
+            logger.error(f"❌ Error stopping scheduler: {e}")
+
+        try:
+            if bot:
+                bot.stop()
+                logger.info("✅ Bot stopped")
+        except Exception as e:
+            logger.error(f"❌ Error stopping bot: {e}")
+
+        logger.info("👋 Study Helper Agent stopped")
 
 if __name__ == "__main__":
     main()

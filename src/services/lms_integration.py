@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 import time
 import hashlib
+from functools import wraps
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -21,6 +22,26 @@ from src.data.models import Course, Document
 from src.services.document_processor import DocumentProcessor
 
 logger = logging.getLogger(__name__)
+
+def retry_on_failure(max_retries: int = 3, delay: float = 1.0):
+    """Decorator to retry function calls on failure"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Attempt {attempt + 1} failed for {func.__name__}: {e}. Retrying in {delay}s...")
+                        time.sleep(delay * (attempt + 1))  # Exponential backoff
+                    else:
+                        logger.error(f"All {max_retries} attempts failed for {func.__name__}: {e}")
+            raise last_exception
+        return wrapper
+    return decorator
 
 class BaseLMSConnector(ABC):
     """Abstract base class for LMS connectors"""
@@ -50,14 +71,15 @@ class BaseLMSConnector(ABC):
 
 class MoodleConnector(BaseLMSConnector):
     """Moodle LMS connector using Web Service API"""
-    
+
     def __init__(self, base_url: str, token: str):
         super().__init__()
         self.base_url = base_url.rstrip('/')
         self.token = token
         self.session = requests.Session()
         self.authenticated = False
-    
+
+    @retry_on_failure(max_retries=2, delay=1.0)
     def authenticate(self) -> bool:
         """Test authentication with Moodle"""
         try:

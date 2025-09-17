@@ -55,6 +55,7 @@ async def oauth_callback(request: Request):
             )
         
         if not state or not code:
+            logger.error(f"Missing OAuth parameters - state: {bool(state)}, code: {bool(code)}")
             return HTMLResponse(
                 content="""
                 <html>
@@ -63,6 +64,7 @@ async def oauth_callback(request: Request):
                     <h1>Authentication Failed</h1>
                     <p>Missing required parameters.</p>
                     <p>Please return to Telegram and try again.</p>
+                    <p><small>If this issue persists, please contact support.</small></p>
                 </body>
                 </html>
                 """,
@@ -74,11 +76,28 @@ async def oauth_callback(request: Request):
         
         # Complete OAuth flow
         try:
+            logger.info(f"Attempting OAuth flow completion for state: {state[:20]}...")
             success = oauth_manager.complete_oauth_flow(state, code)
             logger.info(f"OAuth flow completion result: {success}")
         except Exception as oauth_error:
             logger.error(f"Exception during OAuth flow completion: {oauth_error}", exc_info=True)
             success = False
+
+            # Return more specific error for debugging
+            return HTMLResponse(
+                content=f"""
+                <html>
+                <head><title>Authentication Error</title></head>
+                <body>
+                    <h1>Authentication Processing Failed</h1>
+                    <p>An error occurred while processing your authentication.</p>
+                    <p>Error details: {str(oauth_error)[:200]}</p>
+                    <p>Please return to Telegram and try again.</p>
+                </body>
+                </html>
+                """,
+                status_code=500
+            )
         
         if success:
             logger.info(f"OAuth flow completed successfully for state: {state}")
@@ -163,10 +182,40 @@ async def root():
         """
     )
 
+def validate_oauth_setup():
+    """Validate OAuth configuration on startup"""
+    try:
+        from pathlib import Path
+
+        credentials_path = settings.GOOGLE_CLASSROOM_CREDENTIALS
+        if not credentials_path:
+            logger.error("GOOGLE_CLASSROOM_CREDENTIALS not configured")
+            return False
+
+        if not Path(credentials_path).exists():
+            logger.error(f"Google Classroom credentials file not found: {credentials_path}")
+            return False
+
+        # Test OAuth manager initialization
+        oauth_manager
+        logger.info("✅ OAuth setup validation passed")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ OAuth setup validation failed: {e}")
+        return False
+
 if __name__ == "__main__":
     import uvicorn
-    
+
+    # Validate setup before starting
+    if not validate_oauth_setup():
+        logger.error("OAuth setup validation failed. Please check configuration.")
+        sys.exit(1)
+
     port = int(os.getenv("OAUTH_PORT", "8080"))
+    logger.info(f"Starting OAuth server on port {port}")
+
     uvicorn.run(
         app,
         host="0.0.0.0",
