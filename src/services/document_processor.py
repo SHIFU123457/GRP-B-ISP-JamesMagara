@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import PyPDF2
+import fitz  # PyMuPDF for better PDF extraction
 from docx import Document as DocxDocument
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
@@ -10,11 +11,29 @@ from nltk.corpus import stopwords
 
 logger = logging.getLogger(__name__)
 
+def safe_file_operation(operation_name: str):
+    """Decorator for safe file operations with detailed error reporting"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except FileNotFoundError as e:
+                logger.error(f"{operation_name} failed - File not found: {e}")
+                return None
+            except PermissionError as e:
+                logger.error(f"{operation_name} failed - Permission denied: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"{operation_name} failed - Unexpected error: {e}", exc_info=True)
+                return None
+        return wrapper
+    return decorator
+
 class DocumentProcessor:
     """Process documents and extract text content for RAG pipeline"""
     
     def __init__(self):
-        self.chunk_size = 500  # words per chunk
+        self.chunk_size = 250  # words per chunk (reduced for better chunking)
         self.chunk_overlap = 50  # overlap between chunks
         
         # Download NLTK data if not present
@@ -25,6 +44,7 @@ class DocumentProcessor:
             nltk.download('punkt', quiet=True)
             nltk.download('stopwords', quiet=True)
     
+    @safe_file_operation("Text extraction")
     def extract_text(self, file_path: str, file_type: str) -> Optional[str]:
         """Extract text from various document formats"""
         try:
@@ -42,15 +62,40 @@ class DocumentProcessor:
             logger.error(f"Error extracting text from {file_path}: {e}")
             return None
     
+    @safe_file_operation("PDF text extraction")
     def _extract_pdf_text(self, file_path: str) -> str:
-        """Extract text from PDF files"""
+        """Extract text from PDF files using PyMuPDF (fallback to PyPDF2)"""
         text = ""
-        with open(file_path, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+
+        try:
+            # Try PyMuPDF first (better extraction)
+            doc = fitz.open(file_path)
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                text += page.get_text() + "\n"
+            doc.close()
+
+            # If we got good text, return it
+            if len(text.strip()) > 50:  # Reasonable amount of text
+                logger.info(f"Successfully extracted {len(text)} characters using PyMuPDF")
+                return text.strip()
+        except Exception as e:
+            logger.warning(f"PyMuPDF extraction failed for {file_path}: {e}, trying PyPDF2...")
+
+        # Fallback to PyPDF2
+        try:
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+            logger.info(f"Extracted {len(text)} characters using PyPDF2 fallback")
+        except Exception as e:
+            logger.error(f"Both PDF extraction methods failed for {file_path}: {e}")
+            return ""
+
         return text.strip()
     
+    @safe_file_operation("DOCX text extraction")
     def _extract_docx_text(self, file_path: str) -> str:
         """Extract text from Word documents"""
         doc = DocxDocument(file_path)
@@ -59,6 +104,7 @@ class DocumentProcessor:
             text += paragraph.text + "\n"
         return text.strip()
     
+    @safe_file_operation("TXT text extraction")
     def _extract_txt_text(self, file_path: str) -> str:
         """Extract text from plain text files"""
         with open(file_path, 'r', encoding='utf-8') as file:
