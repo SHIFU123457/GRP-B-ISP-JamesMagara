@@ -10,7 +10,6 @@ from pathlib import Path
 # Add project root directory to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
-
 from config.settings import settings
 from src.services.oauth_manager import UserOAuthManager, oauth_manager as shared_oauth_manager
 
@@ -34,10 +33,15 @@ app.add_middleware(
 async def oauth_callback(request: Request):
     """Handle Google OAuth callback"""
     try:
+        # Debug: Log all incoming parameters
+        logger.info(f"OAuth callback received from {request.client.host}")
+        logger.info(f"Full URL: {request.url}")
+        logger.info(f"Query params: {dict(request.query_params)}")
+
         state = request.query_params.get('state')
         code = request.query_params.get('code')
         error = request.query_params.get('error')
-        
+
         if error:
             logger.error(f"OAuth error: {error}")
             return HTMLResponse(
@@ -177,10 +181,21 @@ async def root():
             <h1>Study Helper Agent OAuth Service</h1>
             <p>This service handles Google Classroom authentication.</p>
             <p>Please use the Telegram bot to initiate authentication.</p>
+            <p>Status: Server is running correctly</p>
         </body>
         </html>
         """
     )
+
+@app.get("/test")
+async def test_endpoint(request: Request):
+    """Test endpoint to verify server is working"""
+    return {
+        "status": "OK",
+        "url": str(request.url),
+        "client": request.client.host if request.client else None,
+        "query_params": dict(request.query_params)
+    }
 
 def validate_oauth_setup():
     """Validate OAuth configuration on startup"""

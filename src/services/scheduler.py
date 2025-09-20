@@ -96,23 +96,24 @@ class SchedulerService:
     
     def _schedule_tasks(self):
         """Set up scheduled tasks"""
-        
-        # Schedule LMS sync every 30 minutes
-        schedule.every(30).minutes.do(self._sync_lms_content)
+
+        # Schedule LMS sync more frequently for better responsiveness (every 10 minutes)
+        sync_interval = getattr(settings, 'LMS_SYNC_INTERVAL_MINUTES', 10)
+        schedule.every(sync_interval).minutes.do(self._sync_lms_content)
 
         # Schedule document processing every 2 minutes (more frequent for better responsiveness)
         schedule.every(2).minutes.do(self._process_pending_documents)
 
         # Also process documents immediately after sync
-        schedule.every(30).minutes.do(self._process_pending_documents)
-        
+        schedule.every(sync_interval).minutes.do(self._process_pending_documents)
+
         # Schedule daily cleanup at 2 AM
         schedule.every().day.at("02:00").do(self._daily_cleanup)
-        
+
         # Schedule weekly full sync every Sunday at 3 AM
         schedule.every().sunday.at("03:00").do(self._weekly_full_sync)
-        
-        logger.info("Scheduled tasks configured")
+
+        logger.info(f"Scheduled tasks configured - LMS sync every {sync_interval} minutes")
     
     def _run_scheduler(self):
         """Run the scheduler loop"""
@@ -154,43 +155,49 @@ class SchedulerService:
             with db_manager.get_session() as session:
                 # Get documents that were recently added (last 35 minutes to account for sync frequency)
                 recent_cutoff = datetime.now() - timedelta(minutes=35)
-                
+
                 recent_docs = session.query(Document).filter(
                     Document.created_at >= recent_cutoff,
                     Document.is_processed == False
                 ).all()
-                
+
                 if not recent_docs:
+                    logger.debug("No recent documents found for notifications")
                     return
-                
+
+                logger.info(f"Found {len(recent_docs)} recent documents for notification")
+
                 # Group documents by course
                 docs_by_course = {}
                 for doc in recent_docs:
                     if doc.course_id not in docs_by_course:
                         docs_by_course[doc.course_id] = []
                     docs_by_course[doc.course_id].append(doc)
-                
+
                 # Send notifications to enrolled users
                 for course_id, documents in docs_by_course.items():
                     course = session.query(Course).filter(Course.id == course_id).first()
                     if not course:
                         continue
-                    
+
+                    logger.info(f"Processing notifications for course: {course.course_name} ({len(documents)} documents)")
+
                     # Get enrolled users
                     enrollments = session.query(CourseEnrollment).filter(
                         CourseEnrollment.course_id == course_id,
                         CourseEnrollment.is_active == True
                     ).all()
-                    
+
                     for enrollment in enrollments:
                         user = session.query(User).filter(User.id == enrollment.user_id).first()
                         if user and user.telegram_id:
+                            logger.info(f"Sending notification to user {user.telegram_id} for {len(documents)} new documents")
                             await self.notification_service.notify_new_materials(
                                 user.telegram_id,
                                 course.course_name,
                                 documents
                             )
-        
+
         except Exception as e:
             logger.error(f"Error sending new document notifications: {e}")
     
