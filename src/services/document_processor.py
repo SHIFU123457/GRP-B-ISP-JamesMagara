@@ -33,8 +33,9 @@ class DocumentProcessor:
     """Process documents and extract text content for RAG pipeline"""
     
     def __init__(self):
-        self.chunk_size = 250  # words per chunk (reduced for better chunking)
-        self.chunk_overlap = 50  # overlap between chunks
+        from config.settings import settings
+        self.chunk_size = settings.CHUNK_SIZE  # words per chunk (from config)
+        self.chunk_overlap = settings.CHUNK_OVERLAP  # overlap between chunks
         
         # Download NLTK data if not present
         try:
