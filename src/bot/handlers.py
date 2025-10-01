@@ -73,6 +73,9 @@ class StudyHelperBot:
         try:
             notifications = scheduler_service.get_pending_notifications()
 
+            if not notifications:
+                return
+
             for notification in notifications:
                 try:
                     # Check if this is an interactive notification
@@ -84,16 +87,21 @@ class StudyHelperBot:
                         await context.bot.send_message(
                             chat_id=notification['user_telegram_id'],
                             text=notification['message'],
-                            reply_markup=reply_markup
+                            reply_markup=reply_markup,
+                            parse_mode='Markdown'
                         )
                         logger.info(f"📤 Sent interactive {notification.get('material_type', 'unknown')} notification to user {notification['user_telegram_id']}")
                     else:
                         # Regular notification without buttons
                         await context.bot.send_message(
                             chat_id=notification['user_telegram_id'],
-                            text=notification['message']
+                            text=notification['message'],
+                            parse_mode='Markdown'
                         )
                         logger.info(f"📤 Sent notification to user {notification['user_telegram_id']}")
+
+                    # Clear notification after successful send
+                    scheduler_service.notification_service.clear_notification(notification)
 
                 except Exception as e:
                     logger.error(f"❌ Failed to send notification to {notification['user_telegram_id']}: {e}")
@@ -1456,15 +1464,40 @@ Use /help for available commands!
             logger.error(f"Failed to send error message to user: {send_error}")
     
     async def run(self):
-        """Start the bot"""
+        """Start the bot and keep it running"""
         logger.info("Starting Study Helper Agent bot...")
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling()
-        await self.application.updater.idle()
-    
-    def stop(self):
-        """Stop the bot"""
-        if self.application:
-            self.application.stop()
-            logger.info("Bot stopped")
+
+        # Set event loop for scheduler
+        from src.services.scheduler import scheduler_service
+        import asyncio
+        scheduler_service.set_event_loop(asyncio.get_running_loop())
+
+        try:
+            # Initialize and start the application
+            await self.application.initialize()
+            await self.application.start()
+
+            # Start polling for updates
+            await self.application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False
+            )
+
+            logger.info("Bot is running. Press Ctrl+C to stop.")
+
+            # Keep running until interrupted
+            stop_event = asyncio.Event()
+
+            # Wait forever (until Ctrl+C)
+            await stop_event.wait()
+
+        except asyncio.CancelledError:
+            logger.info("Bot run cancelled")
+        finally:
+            # Cleanup
+            logger.info("Stopping bot...")
+            if self.application.updater.running:
+                await self.application.updater.stop()
+            await self.application.stop()
+            await self.application.shutdown()
+            logger.info("Bot stopped successfully")

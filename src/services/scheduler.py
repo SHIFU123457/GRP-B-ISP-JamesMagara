@@ -18,57 +18,99 @@ logger = logging.getLogger(__name__)
 
 class NotificationService:
     """Service for sending notifications to users"""
-    
+
     def __init__(self):
         self.telegram_notifications = []  # Store notifications to be sent
-    
-    async def notify_new_materials(self, user_telegram_id: str, course_name: str, documents: List[Document]):
-        """Queue notification about new materials"""
+
+    def notify_new_materials(self, user_telegram_id: str, course_name: str,
+                            documents: List[Document], material_type: str = None):
+        """
+        Queue notification about new materials with interactive buttons
+
+        Args:
+            user_telegram_id: Telegram user ID
+            course_name: Name of the course
+            documents: List of new documents
+            material_type: Type of material (assignment, quiz, reading, announcement)
+        """
         if not documents:
             return
-        
-        # Create notification message
-        doc_list = "\n".join([f"• {doc.title}" for doc in documents[:5]])  # Show max 5
+
+        # Determine material type from documents if not provided
+        if not material_type and documents:
+            material_type = documents[0].material_type or 'reading'
+
+        # Create notification message based on material type
+        if material_type == 'assignment':
+            emoji = "📝"
+            action = "Assignment posted"
+        elif material_type == 'quiz':
+            emoji = "🧠"
+            action = "Quiz posted"
+        elif material_type == 'announcement':
+            emoji = "📢"
+            action = "Announcement posted"
+        else:
+            emoji = "📚"
+            action = "New material posted"
+
+        # Create document list
+        doc_list = "\n".join([f"• {doc.title}" for doc in documents[:5]])
         extra_count = len(documents) - 5
-        
-        message = f"📚 **New materials posted in {course_name}:**\n\n{doc_list}"
-        
+
+        message = f"{emoji} **{action} in {course_name}:**\n\n{doc_list}"
+
         if extra_count > 0:
             message += f"\n\n*...and {extra_count} more documents*"
-        
-        message += "\n\nUse the bot to ask questions about these materials!"
-        
-        # Queue the notification (will be processed by bot)
+
+        # Queue the notification with interactive buttons
         notification = {
             'user_telegram_id': user_telegram_id,
             'message': message,
-            'timestamp': datetime.now()
+            'timestamp': datetime.now(),
+            'interactive': True,  # Enable interactive buttons
+            'material_type': material_type,
+            'document_id': documents[0].id if documents else None,
+            'document_title': documents[0].title if documents else None,
+            'course_name': course_name
         }
-        
+
         self.telegram_notifications.append(notification)
-        logger.info(f"Queued notification for user {user_telegram_id} about {len(documents)} new materials")
-    
+        logger.info(f"Queued {material_type} notification for user {user_telegram_id} about {len(documents)} materials")
+
     def get_pending_notifications(self) -> List[Dict[str, Any]]:
-        """Get and clear pending notifications"""
-        notifications = self.telegram_notifications.copy()
-        self.telegram_notifications.clear()
-        return notifications
+        """Get pending notifications without clearing (to avoid race conditions)"""
+        return self.telegram_notifications.copy()
+
+    def clear_notification(self, notification: Dict[str, Any]):
+        """Clear a specific notification after it's been sent"""
+        try:
+            self.telegram_notifications.remove(notification)
+        except ValueError:
+            pass  # Already removed
 
 class SchedulerService:
     """Service for scheduling and managing automated tasks"""
-    
+
     def __init__(self):
         self.notification_service = NotificationService()
         self.rag_pipeline = None
         self.running = False
         self.executor = ThreadPoolExecutor(max_workers=2)
-        
+        self.gmail_monitor = None  # Will be initialized when needed
+        self.event_loop = None  # Store event loop for async operations
+
         # Initialize RAG pipeline
         try:
             self.rag_pipeline = RAGPipeline()
             logger.info("RAG pipeline initialized in scheduler")
         except Exception as e:
             logger.error(f"Failed to initialize RAG pipeline: {e}")
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop):
+        """Set the event loop for async operations"""
+        self.event_loop = loop
+        logger.info("Event loop set for scheduler")
     
     def start(self):
         """Start the scheduler"""
@@ -97,15 +139,15 @@ class SchedulerService:
     def _schedule_tasks(self):
         """Set up scheduled tasks"""
 
-        # Schedule LMS sync more frequently for better responsiveness (every 10 minutes)
-        sync_interval = getattr(settings, 'LMS_SYNC_INTERVAL_MINUTES', 10)
+        # Schedule Gmail monitoring (every 2 minutes for real-time notifications)
+        schedule.every(2).minutes.do(self._check_gmail_notifications)
+
+        # Schedule LMS sync less frequently now (every 12 hours - Gmail handles real-time)
+        sync_interval = getattr(settings, 'LMS_SYNC_INTERVAL_MINUTES', 720)
         schedule.every(sync_interval).minutes.do(self._sync_lms_content)
 
-        # Schedule document processing every 2 minutes (more frequent for better responsiveness)
-        schedule.every(2).minutes.do(self._process_pending_documents)
-
-        # Also process documents immediately after sync
-        schedule.every(sync_interval).minutes.do(self._process_pending_documents)
+        # Schedule document processing every 3 minutes
+        schedule.every(3).minutes.do(self._process_pending_documents)
 
         # Schedule daily cleanup at 2 AM
         schedule.every().day.at("02:00").do(self._daily_cleanup)
@@ -113,7 +155,7 @@ class SchedulerService:
         # Schedule weekly full sync every Sunday at 3 AM
         schedule.every().sunday.at("03:00").do(self._weekly_full_sync)
 
-        logger.info(f"Scheduled tasks configured - LMS sync every {sync_interval} minutes")
+        logger.info(f"Scheduled tasks configured - Gmail check every 2 min, LMS sync every {sync_interval} min")
     
     def _run_scheduler(self):
         """Run the scheduler loop"""
@@ -127,62 +169,147 @@ class SchedulerService:
                 logger.error(f"Error in scheduler loop: {e}")
                 time.sleep(60)
     
-    def _sync_lms_content(self):
-        """Sync content from all LMS platforms"""
+    def _check_gmail_notifications(self):
+        """Check Gmail for new Classroom notifications and trigger immediate sync"""
         try:
-            logger.info("Starting LMS content sync...")
-            
+            # Lazy initialize Gmail monitor
+            if not self.gmail_monitor:
+                from src.services.gmail_monitor import GmailMonitorService
+                from src.services.oauth_manager import oauth_manager
+                self.gmail_monitor = GmailMonitorService(oauth_manager)
+                logger.info("Gmail monitor initialized")
+
+            logger.debug("Checking Gmail for Classroom notifications...")
+
+            # Check all connected users for new emails
+            user_notifications = self.gmail_monitor.check_all_connected_users()
+
+            if not user_notifications:
+                return
+
+            logger.info(f"Found Gmail notifications for {len(user_notifications)} users")
+
+            # Process each user's notifications
+            for user_id, notifications in user_notifications.items():
+                for notification in notifications:
+                    try:
+                        # Trigger immediate sync for this specific course
+                        sync_result = lms_service.sync_specific_user_course(
+                            user_id=user_id,
+                            course_name_hint=notification.get('course_name'),
+                            material_type=notification.get('material_type')
+                        )
+
+                        if sync_result['success'] and sync_result['new_documents']:
+                            # Immediately process and notify
+                            self._process_pending_documents()
+                            self._notify_new_documents_sync(
+                                user_id,
+                                sync_result['new_documents'],
+                                sync_result.get('course_name', 'Unknown Course'),
+                                notification.get('material_type')
+                            )
+
+                            logger.info(f"✅ Processed Gmail trigger for user {user_id}: {len(sync_result['new_documents'])} new docs")
+
+                    except Exception as e:
+                        logger.error(f"Error processing Gmail notification for user {user_id}: {e}")
+                        continue
+
+        except Exception as e:
+            logger.error(f"Error checking Gmail notifications: {e}")
+
+    def _sync_lms_content(self):
+        """Sync content from all LMS platforms (backup/fallback method)"""
+        try:
+            logger.info("Starting scheduled LMS content sync...")
+
             # Get sync stats
             stats = lms_service.sync_all_materials()
-            
+
             if stats['documents_synced'] > 0:
                 logger.info(f"LMS sync completed: {stats}")
 
                 # Immediately trigger document processing for new documents
                 self._process_pending_documents()
 
-                # Send notifications for new documents
-                asyncio.create_task(self._notify_new_documents())
+                # Send notifications for new documents (use sync version)
+                self._schedule_notifications_from_sync()
             else:
                 logger.info("LMS sync completed - no new documents")
-        
+
         except Exception as e:
             logger.error(f"Error during LMS sync: {e}")
     
-    async def _notify_new_documents(self):
-        """Send notifications about newly synced documents"""
+    def _notify_new_documents_sync(self, user_id: int, documents: List[Document],
+                                   course_name: str, material_type: str = None):
+        """Send notification for specific user and documents (synchronous)"""
         try:
             with db_manager.get_session() as session:
-                # Get documents that were recently added (last 35 minutes to account for sync frequency)
-                recent_cutoff = datetime.now() - timedelta(minutes=35)
+                # Get user's telegram ID
+                user = session.query(User).filter(User.id == user_id).first()
+                if not user or not user.telegram_id:
+                    logger.warning(f"User {user_id} not found or has no Telegram ID")
+                    return
+
+                # Filter out documents that were already notified
+                unsent_docs = [doc for doc in documents if not doc.notification_sent]
+
+                if not unsent_docs:
+                    logger.debug(f"All documents already notified for user {user_id}")
+                    return
+
+                # Send notification
+                self.notification_service.notify_new_materials(
+                    user.telegram_id,
+                    course_name,
+                    unsent_docs,
+                    material_type
+                )
+
+                # Mark documents as notified
+                for doc in unsent_docs:
+                    doc.notification_sent = True
+                    doc.notification_sent_at = datetime.now()
+
+                session.commit()
+
+                logger.info(f"✅ Notification queued for user {user.telegram_id}: {len(unsent_docs)} documents")
+
+        except Exception as e:
+            logger.error(f"Error sending notification for user {user_id}: {e}")
+
+    def _schedule_notifications_from_sync(self):
+        """Send notifications for recently synced documents (fallback method)"""
+        try:
+            with db_manager.get_session() as session:
+                # Get documents that haven't been notified yet (within last hour)
+                recent_cutoff = datetime.now() - timedelta(hours=1)
 
                 recent_docs = session.query(Document).filter(
                     Document.created_at >= recent_cutoff,
-                    Document.is_processed == False
+                    Document.notification_sent == False
                 ).all()
 
                 if not recent_docs:
-                    logger.debug("No recent documents found for notifications")
+                    logger.debug("No unnotified recent documents")
                     return
 
-                logger.info(f"Found {len(recent_docs)} recent documents for notification")
+                logger.info(f"Found {len(recent_docs)} unnotified documents")
 
-                # Group documents by course
+                # Group by course
                 docs_by_course = {}
                 for doc in recent_docs:
                     if doc.course_id not in docs_by_course:
                         docs_by_course[doc.course_id] = []
                     docs_by_course[doc.course_id].append(doc)
 
-                # Send notifications to enrolled users
+                # Notify enrolled users
                 for course_id, documents in docs_by_course.items():
                     course = session.query(Course).filter(Course.id == course_id).first()
                     if not course:
                         continue
 
-                    logger.info(f"Processing notifications for course: {course.course_name} ({len(documents)} documents)")
-
-                    # Get enrolled users
                     enrollments = session.query(CourseEnrollment).filter(
                         CourseEnrollment.course_id == course_id,
                         CourseEnrollment.is_active == True
@@ -191,15 +318,25 @@ class SchedulerService:
                     for enrollment in enrollments:
                         user = session.query(User).filter(User.id == enrollment.user_id).first()
                         if user and user.telegram_id:
-                            logger.info(f"Sending notification to user {user.telegram_id} for {len(documents)} new documents")
-                            await self.notification_service.notify_new_materials(
+                            # Determine material type from documents
+                            material_type = documents[0].material_type if documents else 'reading'
+
+                            self.notification_service.notify_new_materials(
                                 user.telegram_id,
                                 course.course_name,
-                                documents
+                                documents,
+                                material_type
                             )
 
+                            # Mark as notified
+                            for doc in documents:
+                                doc.notification_sent = True
+                                doc.notification_sent_at = datetime.now()
+
+                session.commit()
+
         except Exception as e:
-            logger.error(f"Error sending new document notifications: {e}")
+            logger.error(f"Error scheduling notifications from sync: {e}")
     
     def _process_pending_documents(self):
         """Process documents that haven't been processed yet"""

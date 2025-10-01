@@ -50,7 +50,7 @@ class Settings:
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
 
     # Scheduler Settings
-    LMS_SYNC_INTERVAL_MINUTES: int = int(os.getenv("LMS_SYNC_INTERVAL_MINUTES", "30"))
+    LMS_SYNC_INTERVAL_MINUTES: int = int(os.getenv("LMS_SYNC_INTERVAL_MINUTES", "720"))
     DOCUMENT_PROCESSING_INTERVAL_MINUTES: int = int(os.getenv("DOCUMENT_PROCESSING_INTERVAL_MINUTES", "10"))
     ENABLE_NOTIFICATIONS: bool = os.getenv("ENABLE_NOTIFICATIONS", "True").lower() == "true"
     

@@ -136,10 +136,15 @@ class Document(Base):
     content_text = Column(Text)  # extracted text content
     is_processed = Column(Boolean, default=False)
     processing_status = Column(String, default="pending")  # pending, processing, completed, failed
-    
+
     # LMS Integration
     lms_document_id = Column(String, index=True)
     lms_last_modified = Column(DateTime(timezone=True))
+
+    # Notification tracking
+    notification_sent = Column(Boolean, default=False)
+    notification_sent_at = Column(DateTime(timezone=True))
+    material_type = Column(String)  # assignment, quiz, reading, announcement
 
     # Privacy and access control
     is_public = Column(Boolean, default=False)

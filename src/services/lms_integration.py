@@ -653,7 +653,11 @@ class LMSIntegrationService:
                         drive_file = material['driveFile']['driveFile']
 
                         # Check if it's a supported file type
-                        filename = drive_file['title']
+                        filename = drive_file.get('title') or drive_file.get('name', 'Unknown')
+                        if not filename or filename == 'Unknown':
+                            logger.warning(f"Skipping file with no title in course {course.course_name}")
+                            continue
+
                         file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
 
                         if file_ext in settings.SUPPORTED_FILE_TYPES:
@@ -690,6 +694,65 @@ class LMSIntegrationService:
                                 except Exception as e:
                                     logger.error(f"Failed to download document {filename}: {e}")
                                     continue
+
+            # ALSO sync announcements (where teachers post materials)
+            try:
+                announcements = connector.service.courses().announcements().list(
+                    courseId=course.lms_course_id
+                ).execute()
+
+                for announcement in announcements.get('announcements', []):
+                    # Process attachments in announcements
+                    for material in announcement.get('materials', []):
+                        if 'driveFile' in material:
+                            drive_file = material['driveFile']['driveFile']
+
+                            # Check if it's a supported file type
+                            filename = drive_file.get('title') or drive_file.get('name', 'Unknown')
+                            if not filename or filename == 'Unknown':
+                                logger.warning(f"Skipping announcement file with no title in course {course.course_name}")
+                                continue
+
+                            file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
+
+                            if file_ext in settings.SUPPORTED_FILE_TYPES:
+                                # Check if document already exists
+                                existing_doc = session.query(Document).filter(
+                                    Document.lms_document_id == drive_file['id'],
+                                    Document.course_id == course.id
+                                ).first()
+
+                                if not existing_doc:
+                                    # Download new document
+                                    try:
+                                        local_path = self._download_google_drive_file(
+                                            connector, drive_file, course, filename
+                                        )
+
+                                        if local_path:
+                                            new_document = Document(
+                                                course_id=course.id,
+                                                title=filename,
+                                                file_path=local_path,
+                                                file_type=file_ext,
+                                                file_size=0,
+                                                lms_document_id=drive_file['id'],
+                                                lms_last_modified=datetime.now(),
+                                                is_processed=False,
+                                                processing_status="pending",
+                                                material_type='announcement'  # Mark as announcement
+                                            )
+                                            session.add(new_document)
+                                            session.flush()
+                                            synced_documents.append(new_document)
+                                            logger.info(f"Added new announcement document: {filename}")
+
+                                    except Exception as e:
+                                        logger.error(f"Failed to download announcement document {filename}: {e}")
+                                        continue
+
+            except Exception as announce_error:
+                logger.error(f"Error syncing announcements for course {course.course_name}: {announce_error}")
 
         except Exception as e:
             logger.error(f"Error syncing materials for course {course.course_name}: {e}")
@@ -743,6 +806,108 @@ class LMSIntegrationService:
     def is_platform_connected(self, platform: str) -> bool:
         """Check if a platform is connected and authenticated"""
         return platform in self.connectors
+
+    def sync_specific_user_course(self, user_id: int, course_name_hint: str = None,
+                                  material_type: str = None) -> Dict[str, Any]:
+        """
+        Sync a specific course for a user (triggered by Gmail notification)
+
+        Args:
+            user_id: User database ID
+            course_name_hint: Course name extracted from email (optional)
+            material_type: Type of material (assignment, quiz, reading, announcement)
+
+        Returns:
+            {
+                'success': bool,
+                'new_documents': List[Document],
+                'course_name': str
+            }
+        """
+        stats = {
+            'success': False,
+            'new_documents': [],
+            'course_name': None
+        }
+
+        try:
+            from src.data.models import CourseEnrollment
+
+            # Get user's Google Classroom connector
+            connector = UserGoogleClassroomConnector(user_id, shared_oauth_manager)
+
+            if not connector.authenticate():
+                logger.error(f"Failed to authenticate user {user_id} for triggered sync")
+                return stats
+
+            with db_manager.get_session() as session:
+                # Get user's enrolled courses
+                enrollments = session.query(CourseEnrollment).filter(
+                    CourseEnrollment.user_id == user_id,
+                    CourseEnrollment.is_active == True
+                ).join(Course).filter(
+                    Course.lms_platform == 'google_classroom'
+                ).all()
+
+                if not enrollments:
+                    logger.warning(f"No Google Classroom courses found for user {user_id}")
+                    return stats
+
+                # Try to match course by name hint if provided
+                target_courses = []
+                if course_name_hint:
+                    for enrollment in enrollments:
+                        course = enrollment.course
+                        # Fuzzy match on course name
+                        if (course_name_hint.lower() in course.course_name.lower() or
+                            course.course_name.lower() in course_name_hint.lower()):
+                            target_courses.append(course)
+
+                    if not target_courses:
+                        logger.warning(f"Could not match course hint '{course_name_hint}' for user {user_id}")
+                        # Fall back to syncing all courses
+                        target_courses = [e.course for e in enrollments]
+                else:
+                    # No hint - sync all courses
+                    target_courses = [e.course for e in enrollments]
+
+                logger.info(f"Triggering sync for {len(target_courses)} course(s) for user {user_id}")
+
+                # Sync materials for matched courses
+                all_new_docs = []
+                for course in target_courses:
+                    try:
+                        new_docs = self._sync_google_classroom_materials(
+                            connector, course, session
+                        )
+
+                        # Set material type if provided
+                        if material_type and new_docs:
+                            for doc in new_docs:
+                                if not doc.material_type:
+                                    doc.material_type = material_type
+
+                        all_new_docs.extend(new_docs)
+
+                        if new_docs:
+                            logger.info(f"Found {len(new_docs)} new documents in {course.course_name}")
+                            stats['course_name'] = course.course_name
+
+                    except Exception as e:
+                        logger.error(f"Error syncing course {course.course_name}: {e}")
+                        continue
+
+                session.commit()
+
+                stats['success'] = True
+                stats['new_documents'] = all_new_docs
+
+                logger.info(f"Triggered sync completed: {len(all_new_docs)} new documents")
+
+        except Exception as e:
+            logger.error(f"Error in triggered sync for user {user_id}: {e}")
+
+        return stats
 
 # Global service instance
 lms_service = LMSIntegrationService()
