@@ -367,132 +367,146 @@ class RAGPipeline:
                 'has_relevant_content': False
             }
    
-    def _is_casual_conversation(self, query: str) -> bool:
-        """Determine if query is casual conversation vs academic question"""
+    def _is_educational_query(self, query: str) -> bool:
+        """Determine if query is education-related and should use course materials"""
         query_lower = query.lower().strip()
 
-        # Greetings and casual conversation patterns
-        casual_patterns = [
-            # Greetings
-            'hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening',
-            'how are you', 'how\'s your day', 'how is your day', 'whats up', 'what\'s up',
+        # First check for clearly NON-educational topics that should use model directly
+        non_educational_topics = [
+            # Weather
+            'weather', 'rain', 'snow', 'sunny', 'cloudy', 'temperature', 'forecast',
+            'climate', 'storm', 'hurricane', 'tornado', 'cold', 'hot', 'warm',
 
-            # Personal questions about the bot
-            'tell me about yourself', 'who are you', 'what are you', 'introduce yourself',
-            'what do you do', 'what can you do',
+            # Religion/Philosophy/Beliefs
+            'god', 'religion', 'belief', 'faith', 'pray', 'church', 'mosque', 'temple',
+            'spiritual', 'soul', 'heaven', 'hell', 'afterlife', 'meaning of life',
 
-            # Casual chat
-            'how\'s it going', 'how is it going', 'nice to meet you', 'pleasure to meet you',
-            'thanks', 'thank you', 'goodbye', 'bye', 'see you later', 'talk to you later',
+            # Personal/Social
+            'relationship', 'dating', 'love', 'marriage', 'family', 'friend', 'friendship',
+            'personal', 'emotion', 'feeling', 'happiness', 'sadness', 'depression',
 
-            # Weather/general small talk
-            'how\'s the weather', 'nice day', 'beautiful day',
+            # Entertainment
+            'movie', 'film', 'music', 'song', 'game', 'sport', 'football', 'basketball',
+            'celebrity', 'actor', 'actress', 'singer', 'artist', 'tv show', 'netflix',
 
-            # Single word greetings
-            'morning', 'afternoon', 'evening'
+            # Current events/News
+            'news', 'politics', 'election', 'president', 'government', 'war', 'economy',
+            'stock market', 'bitcoin', 'cryptocurrency', 'current events',
+
+            # Health/Medical (non-academic)
+            'doctor', 'medicine', 'sick', 'disease', 'symptom', 'pain', 'headache',
+            'diet', 'exercise', 'weight', 'fitness',
+
+            # Technology (non-academic/consumer)
+            'iphone', 'android', 'smartphone', 'social media', 'facebook', 'twitter',
+            'instagram', 'tiktok', 'youtube', 'netflix',
+
+            # Food/Cooking
+            'recipe', 'cooking', 'food', 'restaurant', 'meal', 'dinner', 'lunch',
+            'breakfast', 'taste', 'delicious',
+
+            # Travel
+            'travel', 'vacation', 'hotel', 'flight', 'airport', 'tourist', 'destination',
+
+            # Shopping/Consumer
+            'buy', 'purchase', 'shop', 'price', 'cost', 'expensive', 'cheap',
+            'brand', 'product', 'store'
         ]
 
-        # Check if query starts with or contains casual patterns
-        for pattern in casual_patterns:
-            if query_lower.startswith(pattern) or query_lower == pattern:
-                return True
-            # For very short queries that are just greetings
-            if len(query_lower.split()) <= 3 and pattern in query_lower:
+        # Check for non-educational topics first
+        for topic in non_educational_topics:
+            if topic in query_lower:
+                return False  # Not educational, use model directly
+
+        # Educational keywords that indicate academic content
+        educational_keywords = [
+            # Academic subjects
+            'explain', 'definition', 'define', 'algorithm', 'concept',
+            'theory', 'principle', 'method', 'technique', 'process', 'procedure',
+
+            # Academic activities
+            'assignment', 'homework', 'project', 'exam', 'test', 'quiz', 'study', 'learn',
+            'understand', 'solve', 'calculate', 'analyze', 'compare', 'discuss',
+
+            # Course-related terms
+            'course', 'class', 'lecture', 'textbook', 'material', 'document', 'notes',
+            'chapter', 'section', 'topic', 'subject', 'syllabus',
+
+            # Specific academic domains (add more based on your courses)
+            'database', 'programming', 'computer science', 'mathematics', 'engineering',
+            'biology', 'chemistry', 'physics', 'statistics', 'data structure',
+            'sql', 'python', 'java', 'algorithm', 'software', 'putty', 'ssh',
+            'normalization', 'query', 'table', 'function', 'variable', 'loop',
+            'array', 'stack', 'queue', 'tree', 'graph', 'sorting', 'searching'
+        ]
+
+        # Direct references to documents/materials
+        document_references = [
+            'from my documents', 'in my materials', 'from the textbook',
+            'according to', 'based on the', 'from the course',
+            'in the assignment', 'from my notes', 'from my course'
+        ]
+
+        # Check for direct document references (always educational)
+        for ref in document_references:
+            if ref in query_lower:
                 return True
 
-        # Check for question marks with casual content
-        if '?' in query_lower:
-            casual_question_patterns = [
-                'how are you', 'who are you', 'what are you', 'how\'s your day',
-                'what do you do', 'tell me about yourself'
-            ]
-            for pattern in casual_question_patterns:
-                if pattern in query_lower:
+        # Check for educational keywords
+        for keyword in educational_keywords:
+            if keyword in query_lower:
+                return True
+
+        # Special case for "what is" - only educational if it's about technical/academic topics
+        if 'what is' in query_lower:
+            # Extract what they're asking about
+            what_about = query_lower.split('what is')[-1].strip()
+            # If it contains educational terms, it's educational
+            for keyword in educational_keywords:
+                if keyword in what_about:
                     return True
 
+        # Special case for "how to" - only educational if it's about technical/academic topics
+        if 'how to' in query_lower:
+            how_about = query_lower.split('how to')[-1].strip()
+            for keyword in educational_keywords:
+                if keyword in how_about:
+                    return True
+
+        # Default: if no clear educational indicators, treat as non-educational
         return False
 
-    def _generate_casual_response(self, query: str, user_preferences: Dict[str, Any] = None) -> str:
-        """Generate appropriate casual conversation responses"""
-        query_lower = query.lower().strip()
-
-        # Greetings
-        if any(greeting in query_lower for greeting in ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening']):
-            return "Hello! I'm your Study Helper Agent. I'm here to help you with questions about your course materials, assignments, and academic content. How can I assist you with your studies today?"
-
-        # How are you / How's your day
-        if any(phrase in query_lower for phrase in ['how are you', 'how\'s your day', 'how is your day', 'how\'s it going']):
-            return "I'm doing great, thank you for asking! I'm ready to help you with your studies. I can answer questions about your course materials, explain concepts, help with assignments, or provide information from your uploaded documents. What would you like to learn about today?"
-
-        # About yourself / Who are you
-        if any(phrase in query_lower for phrase in ['tell me about yourself', 'who are you', 'what are you', 'introduce yourself']):
-            return """I'm your AI Study Helper Agent! Here's what I can do for you:
-
-ACADEMIC SUPPORT:
-- Answer questions about your course materials
-- Explain concepts from your textbooks and lecture notes
-- Help with assignments and homework
-- Provide summaries of your documents
-
-SMART SEARCH:
-- Find relevant information from your uploaded materials
-- Reference specific documents and sources
-- Connect concepts across different courses
-
-PERSONALIZED LEARNING:
-- Adapt to your learning style and preferences
-- Provide explanations at your preferred difficulty level
-- Track your learning progress
-
-Just ask me anything about your studies, and I'll search through your course materials to give you the most relevant, helpful answers!"""
-
-        # What can you do
-        if any(phrase in query_lower for phrase in ['what do you do', 'what can you do']):
-            return """I can help you with your academic studies in several ways:
-
-ANSWER QUESTIONS: Ask me about any topic from your course materials
-SEARCH DOCUMENTS: I'll find relevant information from your uploaded files
-EXPLAIN CONCEPTS: Get clear explanations tailored to your learning style
-ASSIGNMENT HELP: Guidance based on your actual course content
-STUDY SUPPORT: Summaries, examples, and step-by-step explanations
-
-Try asking me something like:
-- "Explain database normalization from my course materials"
-- "What does my textbook say about data structures?"
-- "Help me understand the assignment requirements"
-
-What would you like to learn about?"""
-
-        # Thanks
-        if any(phrase in query_lower for phrase in ['thanks', 'thank you']):
-            return "You're very welcome! I'm always here to help with your studies. Feel free to ask me any questions about your course materials anytime!"
-
-        # Goodbye
-        if any(phrase in query_lower for phrase in ['goodbye', 'bye', 'see you later', 'talk to you later']):
-            return "Goodbye! Good luck with your studies. I'll be here whenever you need help with your course materials. Have a great day!"
-
-        # Default casual response
-        return "I'm your Study Helper Agent, ready to assist you with your academic questions! I can help you understand concepts from your course materials, find information in your documents, and support your learning. What would you like to study today?"
+    def _generate_non_educational_response(self, query: str, user_preferences: Dict[str, Any] = None) -> str:
+        """Use LLM to generate natural response for non-educational queries"""
+        try:
+            # Use the LLM service to respond naturally without course materials
+            response = self.llm_service.generate_response(query, "", user_preferences)
+            return response
+        except Exception as e:
+            logger.error(f"Error generating non-educational response: {e}")
+            # Simple fallback if LLM fails
+            return "I'm here to help with your studies! Feel free to ask me about your course materials or any academic topics."
 
     def generate_rag_response(self, query: str, course_id: Optional[int] = None, user_preferences: Dict[str, Any] = None) -> Dict[str, Any]:
         """Generate complete RAG response using LLM with retrieved context"""
         try:
-            # Check if this is casual conversation that shouldn't use course materials
-            if self._is_casual_conversation(query):
-                logger.info(f"Detected casual conversation query: '{query[:50]}...' - responding without course materials")
+            # Check if this is an educational query that should use course materials
+            if not self._is_educational_query(query):
+                logger.info(f"Detected non-educational query: '{query[:50]}...' - using model without course materials")
 
-                # Generate a friendly, personal response without course context
-                casual_response = self._generate_casual_response(query, user_preferences)
+                # Use LLM to respond naturally to non-educational queries
+                non_educational_response = self._generate_non_educational_response(query, user_preferences)
 
                 return {
-                    'response': casual_response,
+                    'response': non_educational_response,
                     'context_used': False,
                     'sources': [],
                     'confidence': 'high',
-                    'reason': 'casual_conversation'
+                    'reason': 'non_educational_query'
                 }
 
-            # Generate context from relevant documents for academic questions
+            # Generate context from relevant documents for educational questions
+            logger.info(f"Detected educational query: '{query[:50]}...' - searching course materials")
             context_data = self.generate_context(query, course_id)
 
             if not context_data['has_relevant_content']:

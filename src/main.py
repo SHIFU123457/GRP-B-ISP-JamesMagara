@@ -36,8 +36,13 @@ def initialize_lms_integration():
             logging.info(f"LMS integration initialized with platforms: {platforms}")
             return True
         else:
-            logging.warning("No LMS platforms configured or accessible")
-            return False
+            # Check if per-user OAuth is enabled (Google Classroom)
+            if getattr(settings, 'PER_USER_GOOGLE_OAUTH', True):
+                logging.info("Per-user Google Classroom OAuth enabled - LMS will work per-user basis")
+                return True
+            else:
+                logging.warning("No LMS platforms configured or accessible")
+                return False
     except Exception as e:
         logging.error(f"Failed to initialize LMS integration: {e}")
         return False
@@ -155,7 +160,7 @@ def main():
 
         # Start the bot
         logger.info("🎆 Study Helper Agent is now running!")
-        bot.run()
+        asyncio.run(bot.run())
 
     except KeyboardInterrupt:
         logger.info("❌ Received keyboard interrupt. Shutting down...")

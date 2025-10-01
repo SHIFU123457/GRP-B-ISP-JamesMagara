@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -69,24 +69,88 @@ class StudyHelperBot:
             logger.error(f"Failed to start notification handler: {e}")
     
     async def _process_notifications(self, context: ContextTypes.DEFAULT_TYPE):
-        """Process pending notifications from scheduler"""
+        """Process pending notifications from scheduler with interactive buttons"""
         try:
             notifications = scheduler_service.get_pending_notifications()
-            
+
             for notification in notifications:
                 try:
-                    await context.bot.send_message(
-                        chat_id=notification['user_telegram_id'],
-                        text=notification['message'],
-                        parse_mode='Markdown'
-                    )
-                    logger.info(f"Sent notification to user {notification['user_telegram_id']}")
-                    
+                    # Check if this is an interactive notification
+                    if notification.get('interactive', False):
+                        # Create inline keyboard based on material type
+                        keyboard = self._create_notification_keyboard(notification)
+                        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+                        await context.bot.send_message(
+                            chat_id=notification['user_telegram_id'],
+                            text=notification['message'],
+                            reply_markup=reply_markup
+                        )
+                        logger.info(f"📤 Sent interactive {notification.get('material_type', 'unknown')} notification to user {notification['user_telegram_id']}")
+                    else:
+                        # Regular notification without buttons
+                        await context.bot.send_message(
+                            chat_id=notification['user_telegram_id'],
+                            text=notification['message']
+                        )
+                        logger.info(f"📤 Sent notification to user {notification['user_telegram_id']}")
+
                 except Exception as e:
-                    logger.error(f"Failed to send notification to {notification['user_telegram_id']}: {e}")
-                    
+                    logger.error(f"❌ Failed to send notification to {notification['user_telegram_id']}: {e}")
+
         except Exception as e:
-            logger.error(f"Error processing notifications: {e}")
+            logger.error(f"❌ Error processing notifications: {e}")
+
+    def _create_notification_keyboard(self, notification: dict) -> List[List[InlineKeyboardButton]]:
+        """Create interactive keyboard for notifications"""
+        material_type = notification.get('material_type', 'reading')
+        document_title = notification.get('document_title', '')
+        course_name = notification.get('course_name', '')
+        document_id = notification.get('document_id', '')
+
+        keyboard = []
+
+        if material_type == 'assignment':
+            keyboard = [
+                [
+                    InlineKeyboardButton("📝 Help with Assignment",
+                                       callback_data=f"help_assignment_{document_id}"),
+                    InlineKeyboardButton("📋 Break Down Tasks",
+                                       callback_data=f"breakdown_assignment_{document_id}")
+                ],
+                [
+                    InlineKeyboardButton("🔍 Explain Requirements",
+                                       callback_data=f"explain_assignment_{document_id}")
+                ]
+            ]
+        elif material_type == 'quiz':
+            keyboard = [
+                [
+                    InlineKeyboardButton("🧠 Help Me Study",
+                                       callback_data=f"study_quiz_{document_id}"),
+                    InlineKeyboardButton("❓ Practice Questions",
+                                       callback_data=f"practice_quiz_{document_id}")
+                ],
+                [
+                    InlineKeyboardButton("📝 Key Concepts",
+                                       callback_data=f"concepts_quiz_{document_id}")
+                ]
+            ]
+        else:  # reading material
+            keyboard = [
+                [
+                    InlineKeyboardButton("📖 Summarize Document",
+                                       callback_data=f"summarize_reading_{document_id}"),
+                    InlineKeyboardButton("❓ Ask Questions",
+                                       callback_data=f"questions_reading_{document_id}")
+                ],
+                [
+                    InlineKeyboardButton("🔍 Key Points",
+                                       callback_data=f"keypoints_reading_{document_id}")
+                ]
+            ]
+
+        return keyboard
         
     
     def _add_handlers(self):
@@ -844,7 +908,13 @@ Choose a setting to modify:
                     "🔔 Notifications enabled! I'll notify you when new course materials are available.",
                     parse_mode='Markdown'
                 )
-            
+
+            # Handle material assistance callbacks
+            elif callback_data.startswith(("help_assignment_", "breakdown_assignment_", "explain_assignment_",
+                                          "study_quiz_", "practice_quiz_", "concepts_quiz_",
+                                          "summarize_reading_", "questions_reading_", "keypoints_reading_")):
+                await self._handle_material_assistance(update, context, callback_data)
+
             else:
                 await query.edit_message_text("Feature coming soon! Though sifai kujibu hivi mkuu. \n\n Kwa handle_callback")
                 
@@ -852,8 +922,105 @@ Choose a setting to modify:
             logger.error(f"Error in handle_callback: {e}")
             await query.edit_message_text("Sorry, something went wrong. Please try again. \n\n Kwa handle_callback superior")
 
+    async def _handle_material_assistance(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
+        """Handle material assistance button clicks"""
+        query = update.callback_query
+        user_data = query.from_user
 
-    
+        try:
+            # Parse callback data to extract action and document ID
+            parts = callback_data.split("_")
+            if len(parts) < 3:
+                await query.edit_message_text("❌ Invalid request format")
+                return
+
+            action = "_".join(parts[:-1])  # e.g., "help_assignment", "summarize_reading"
+            document_id = parts[-1]
+
+            # Get document details
+            with db_manager.get_session() as session:
+                from src.data.models import Document
+                document = session.query(Document).filter(Document.id == document_id).first()
+
+                if not document:
+                    await query.edit_message_text("❌ Document not found")
+                    return
+
+                # Get user
+                user = session.query(User).filter(User.telegram_id == str(user_data.id)).first()
+                if not user:
+                    await query.edit_message_text("❌ Please use /start first to create your profile.")
+                    return
+
+            # Update the message to show we're working on it
+            await query.edit_message_text(f"🤖 **Working on your request...**\n\n📄 *{document.title}*\n\n⏳ Please wait while I analyze the material...")
+
+            # Generate appropriate response based on the action
+            response = await self._generate_material_response(action, document, user)
+
+            # Send the response (split if too long)
+            response_parts = self._split_long_message(response)
+
+            # Edit the first message
+            await query.edit_message_text(response_parts[0])
+
+            # Send additional parts as new messages if needed
+            for part in response_parts[1:]:
+                await context.bot.send_message(chat_id=query.message.chat_id, text=part)
+
+            logger.info(f"📤 Handled {action} request for document {document.title} by user {user.telegram_id}")
+
+        except Exception as e:
+            logger.error(f"❌ Error handling material assistance: {e}")
+            await query.edit_message_text("❌ Sorry, something went wrong while processing your request. Please try again.")
+
+    async def _generate_material_response(self, action: str, document: Document, user: User) -> str:
+        """Generate appropriate response based on the requested action"""
+        try:
+            # Create context-aware queries based on the action
+            if action == "help_assignment":
+                query = f"Help me understand and complete the assignment '{document.title}'. What are the main requirements and how should I approach it?"
+            elif action == "breakdown_assignment":
+                query = f"Break down the assignment '{document.title}' into smaller, manageable tasks. What steps should I follow?"
+            elif action == "explain_assignment":
+                query = f"Explain the requirements and expectations for the assignment '{document.title}'. What exactly am I supposed to do?"
+            elif action == "study_quiz":
+                query = f"Help me prepare for the quiz/test '{document.title}'. What topics should I focus on studying?"
+            elif action == "practice_quiz":
+                query = f"Create practice questions based on the material in '{document.title}' to help me prepare."
+            elif action == "concepts_quiz":
+                query = f"What are the key concepts and topics I should understand for '{document.title}'?"
+            elif action == "summarize_reading":
+                query = f"Provide a comprehensive summary of the key points in '{document.title}'"
+            elif action == "questions_reading":
+                query = f"I have questions about the content in '{document.title}'. Can you help me understand it better?"
+            elif action == "keypoints_reading":
+                query = f"What are the main key points and important concepts in '{document.title}'?"
+            else:
+                query = f"Help me understand the content in '{document.title}'"
+
+            # Use the RAG pipeline to get a contextual response
+            if self.rag_pipeline:
+                response = await self._process_query_rag_enhanced(query, user)
+
+                # Add a helpful header
+                if action.startswith("help_assignment"):
+                    header = "📝 **Assignment Help**\n\n"
+                elif action.startswith("study_quiz") or action.startswith("practice_quiz") or action.startswith("concepts_quiz"):
+                    header = "🧠 **Study Assistance**\n\n"
+                else:
+                    header = "📖 **Material Summary**\n\n"
+
+                return header + response
+            else:
+                return "❌ Sorry, I'm currently unable to process your request. The content analysis system is not available."
+
+        except Exception as e:
+            logger.error(f"❌ Error generating material response: {e}")
+            return "❌ Sorry, I encountered an error while analyzing the material. Please try asking your question directly in a message."
+
+
+
     async def _process_query_rag_enhanced(self, query: str, user: User) -> str:
         """Enhanced query processing with RAG pipeline and LLM integration"""
         if not self.rag_pipeline:
@@ -1288,10 +1455,13 @@ Use /help for available commands!
         except Exception as send_error:
             logger.error(f"Failed to send error message to user: {send_error}")
     
-    def run(self):
+    async def run(self):
         """Start the bot"""
         logger.info("Starting Study Helper Agent bot...")
-        self.application.run_polling()
+        await self.application.initialize()
+        await self.application.start()
+        await self.application.updater.start_polling()
+        await self.application.updater.idle()
     
     def stop(self):
         """Stop the bot"""
