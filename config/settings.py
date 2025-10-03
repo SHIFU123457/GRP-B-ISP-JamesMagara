@@ -42,8 +42,9 @@ class Settings:
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "75"))  # overlap words (increased)
     TOP_K_RETRIEVAL: int = int(os.getenv("TOP_K_RETRIEVAL", "10"))  # chunks to retrieve (increased for comprehensive responses)
     SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.25"))  # minimum similarity (lowered for better recall)
-    CONTEXT_MAX_LENGTH: int = int(os.getenv("CONTEXT_MAX_LENGTH", "6000"))  # max context length for LLM (increased)
+    CONTEXT_MAX_LENGTH: int = int(os.getenv("CONTEXT_MAX_LENGTH", "4000"))  # max context length for LLM (increased)
     HIGH_QUALITY_THRESHOLD: float = float(os.getenv("HIGH_QUALITY_THRESHOLD", "0.3"))  # threshold for quality filtering
+    MAX_RESPONSE_LENGTH: int = int(os.getenv("MAX_RESPONSE_LENGTH", "4000"))  # max LLM response length in characters
 
     # Document Processing Settings
     SUPPORTED_FILE_TYPES: list = ["pdf", "docx", "txt", "doc", "pptx", "ppt"]

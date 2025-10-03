@@ -611,9 +611,9 @@ class LMSIntegrationService:
                                 )
                                 session.add(enrollment)
 
-                            # Sync course materials
+                            # Sync course materials (scheduled sync - don't re-notify)
                             documents = self._sync_google_classroom_materials(
-                                connector, course, session
+                                connector, course, session, include_unnotified=False
                             )
                             stats["documents_synced"] += len(documents)
 
@@ -636,8 +636,16 @@ class LMSIntegrationService:
         return stats
 
     def _sync_google_classroom_materials(self, connector: UserGoogleClassroomConnector,
-                                       course: Course, session) -> List[Document]:
-        """Sync materials for a Google Classroom course"""
+                                       course: Course, session, include_unnotified: bool = True) -> List[Document]:
+        """
+        Sync materials for a Google Classroom course
+
+        Args:
+            connector: Google Classroom API connector
+            course: Course to sync
+            session: Database session
+            include_unnotified: If True, include existing documents that haven't been notified yet
+        """
         synced_documents = []
 
         try:
@@ -694,6 +702,12 @@ class LMSIntegrationService:
                                 except Exception as e:
                                     logger.error(f"Failed to download document {filename}: {e}")
                                     continue
+                            elif include_unnotified and not existing_doc.notification_sent:
+                                # Gmail-triggered sync: include existing un-notified documents
+                                synced_documents.append(existing_doc)
+                                logger.info(f"Re-queuing existing un-notified document: {filename}")
+                        else:
+                            logger.debug(f"Skipping unsupported file type '{file_ext}': {filename}")
 
             # ALSO sync announcements (where teachers post materials)
             try:
@@ -750,6 +764,10 @@ class LMSIntegrationService:
                                     except Exception as e:
                                         logger.error(f"Failed to download announcement document {filename}: {e}")
                                         continue
+                                elif include_unnotified and not existing_doc.notification_sent:
+                                    # Gmail-triggered sync: include existing un-notified documents
+                                    synced_documents.append(existing_doc)
+                                    logger.info(f"Re-queuing existing un-notified announcement: {filename}")
 
             except Exception as announce_error:
                 logger.error(f"Error syncing announcements for course {course.course_name}: {announce_error}")
@@ -761,9 +779,27 @@ class LMSIntegrationService:
 
     def _download_google_drive_file(self, connector: UserGoogleClassroomConnector,
                                    drive_file: Dict, course: Course, filename: str) -> Optional[str]:
-        """Download a file from Google Drive"""
+        """Download a file from Google Drive with size limit check"""
         try:
             file_id = drive_file['id']
+
+            # Check file size before downloading (get metadata)
+            file_metadata = connector.drive_service.files().get(
+                fileId=file_id,
+                fields='size,name'
+            ).execute()
+
+            file_size_bytes = int(file_metadata.get('size', 0))
+            file_size_mb = file_size_bytes / (1024 * 1024)
+
+            # Enforce file size limit (default: 25MB from settings)
+            max_size_mb = settings.MAX_FILE_SIZE_MB
+            if file_size_mb > max_size_mb:
+                logger.warning(
+                    f"Skipping file {filename}: {file_size_mb:.1f}MB exceeds limit of {max_size_mb}MB. "
+                    f"Large textbooks can cause connection timeouts."
+                )
+                return None
 
             # Create local directory
             local_dir = Path("./data/documents")
@@ -780,7 +816,7 @@ class LMSIntegrationService:
             with open(local_path, 'wb') as f:
                 f.write(content)
 
-            logger.info(f"Downloaded Google Drive file: {local_path}")
+            logger.info(f"Downloaded Google Drive file: {local_path} ({file_size_mb:.1f}MB)")
             return str(local_path)
 
         except Exception as e:
@@ -877,6 +913,7 @@ class LMSIntegrationService:
                 all_new_docs = []
                 for course in target_courses:
                     try:
+                        logger.debug(f"Syncing course: {course.course_name}")
                         new_docs = self._sync_google_classroom_materials(
                             connector, course, session
                         )
@@ -892,6 +929,8 @@ class LMSIntegrationService:
                         if new_docs:
                             logger.info(f"Found {len(new_docs)} new documents in {course.course_name}")
                             stats['course_name'] = course.course_name
+                        else:
+                            logger.debug(f"No new documents in {course.course_name}")
 
                     except Exception as e:
                         logger.error(f"Error syncing course {course.course_name}: {e}")
@@ -899,8 +938,12 @@ class LMSIntegrationService:
 
                 session.commit()
 
+                # Extract document IDs before session closes (objects will be detached)
+                doc_ids = [doc.id for doc in all_new_docs]
+
                 stats['success'] = True
                 stats['new_documents'] = all_new_docs
+                stats['new_document_ids'] = doc_ids
 
                 logger.info(f"Triggered sync completed: {len(all_new_docs)} new documents")
 

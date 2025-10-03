@@ -49,7 +49,7 @@ Bot Commands
 /start : Initialize bot and create user profile
 /help : Display help message with command list
 /courses : View enrolled courses
-/connect : classroomConnect Google Classroom account
+/connect_classroom : classroomConnect Google Classroom account
 /disconnect_classroom : Disconnect Google Classroom
 /connections : View LMS connection status
 /sync : Manually sync course materials
