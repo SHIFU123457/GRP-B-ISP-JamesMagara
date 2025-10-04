@@ -505,15 +505,22 @@ Try /connect_classroom again if the issue persists.
                     else:
                         course_list = []
                         for course in google_courses:
+                            # Escape special HTML characters
+                            import html
+                            course_name = html.escape(course.get('name', 'Unnamed Course'))
+                            course_id = html.escape(str(course.get('id', 'N/A')))
+                            course_section = html.escape(str(course.get('section', 'N/A')))
+                            course_desc = html.escape(str(course.get('descriptionHeading', 'N/A')))
+
                             course_list.append(
-                                f"📋 **{course.get('name', 'Unnamed Course')}**\n"
-                                f"   • ID: {course.get('id', 'N/A')}\n"
-                                f"   • Section: {course.get('section', 'N/A')}\n"
-                                f"   • Description: {course.get('descriptionHeading', 'N/A')}"
+                                f"📋 <b>{course_name}</b>\n"
+                                f"   • ID: {course_id}\n"
+                                f"   • Section: {course_section}\n"
+                                f"   • Description: {course_desc}"
                             )
 
                         courses_text = f"""
-📚 **Your Google Classroom Courses**
+📚 <b>Your Google Classroom Courses</b>
 
 {chr(10).join(course_list)}
 
@@ -523,7 +530,7 @@ These are your live Google Classroom courses. Use /sync to download course mater
                 except Exception as gc_error:
                     logger.error(f"Error fetching Google Classroom courses: {gc_error}")
                     courses_text = """
-📚 **Your Courses**
+📚 <b>Your Courses</b>
 
 Failed to fetch courses from Google Classroom. This might be due to:
 • Network connectivity issues
@@ -539,7 +546,11 @@ Try /connect_classroom again to refresh your connection.
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
-                await update.message.reply_text(courses_text, reply_markup=reply_markup, parse_mode='Markdown')
+                # Log the message for debugging
+                logger.debug(f"Courses text to send (length={len(courses_text)}): {courses_text[:300]}")
+
+                # Send with HTML parse mode (more forgiving than Markdown)
+                await update.message.reply_text(courses_text, reply_markup=reply_markup, parse_mode='HTML')
 
         except Exception as e:
             logger.error(f"Error in courses_command: {e}", exc_info=True)
