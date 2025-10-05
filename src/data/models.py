@@ -22,6 +22,24 @@ class User(Base):
     learning_style = Column(String, default="adaptive")  # visual, auditory, kinesthetic, adaptive
     difficulty_preference = Column(String, default="medium")  # easy, medium, hard
     interaction_frequency = Column(Float, default=0.0)  # interactions per day
+
+    # OAuth credentials (encrypted JSON)
+    google_credentials = Column(Text)  # Store encrypted Google OAuth credentials
+    moodle_credentials = Column(Text)  # Future: for Moodle user-level auth
+    
+    # LMS connection status
+    google_classroom_connected = Column(Boolean, default=False)
+    moodle_connected = Column(Boolean, default=False)
+    last_oauth_refresh = Column(DateTime(timezone=True))
+    
+    # Privacy preferences
+    allow_data_collection = Column(Boolean, default=True)
+    notification_preferences = Column(JSON, default=lambda: {
+        'new_materials': True,
+        'assignments': True,
+        'announcements': True,
+        'reminders': True
+    })
     
     # Metadata
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -31,6 +49,31 @@ class User(Base):
     # Relationships
     interactions = relationship("UserInteraction", back_populates="user")
     enrollments = relationship("CourseEnrollment", back_populates="user")
+
+class UserLMSConnection(Base):
+    """Track LMS connections per user"""
+    __tablename__ = "user_lms_connections"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    lms_platform = Column(String, nullable=False)  # 'google_classroom', 'moodle'
+    
+    # Connection details
+    is_active = Column(Boolean, default=True)
+    credentials_encrypted = Column(Text)  # Encrypted credentials
+    last_sync = Column(DateTime(timezone=True))
+    sync_status = Column(String, default="pending")  # pending, active, failed, expired
+    
+    # Error tracking
+    last_error = Column(Text)
+    error_count = Column(Integer, default=0)
+    
+    # Metadata
+    connected_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    # Relationships
+    user = relationship("User")
 
 class Course(Base):
     """Course model representing academic courses"""
@@ -43,6 +86,9 @@ class Course(Base):
     semester = Column(String)
     year = Column(Integer)
     
+    # Privacy settings
+    is_public = Column(Boolean, default=False)  # Whether course materials are shared
+
     # LMS Integration
     lms_course_id = Column(String, index=True)  # External LMS course ID
     lms_platform = Column(String)  # moodle, google_classroom, etc.
@@ -65,6 +111,9 @@ class CourseEnrollment(Base):
     course_id = Column(Integer, ForeignKey("courses.id"), nullable=False)
     enrollment_date = Column(DateTime(timezone=True), server_default=func.now())
     is_active = Column(Boolean, default=True)
+
+    # Enrollment source tracking
+    enrolled_via_platform = Column(String)  # Which LMS this enrollment came from
     
     # Relationships
     user = relationship("User", back_populates="enrollments")
@@ -91,6 +140,10 @@ class Document(Base):
     # LMS Integration
     lms_document_id = Column(String, index=True)
     lms_last_modified = Column(DateTime(timezone=True))
+
+    # Privacy and access control
+    is_public = Column(Boolean, default=False)
+    access_level = Column(String, default="enrolled")  # enrolled, public, restricted
     
     # Metadata
     created_at = Column(DateTime(timezone=True), server_default=func.now())
