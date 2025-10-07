@@ -55,6 +55,14 @@ class Settings:
     # API Rate Limiting
     MOODLE_API_RATE_LIMIT: int = int(os.getenv("MOODLE_API_RATE_LIMIT", "100"))  # requests per hour
     GOOGLE_API_RATE_LIMIT: int = int(os.getenv("GOOGLE_API_RATE_LIMIT", "1000"))
+
+    # LLM Configuration
+    HUGGINGFACE_API_TOKEN: Optional[str] = os.getenv("HUGGINGFACE_API_TOKEN")
+    USE_LOCAL_LLM: bool = os.getenv("USE_LOCAL_LLM", "False").lower() == "true"
+    LLM_TIMEOUT_SECONDS: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+
+    # Fallback configuration
+    ENABLE_LLM_FALLBACK: bool = os.getenv("ENABLE_LLM_FALLBACK", "True").lower() == "true"
     
     # Validation
     def validate(self) -> bool:

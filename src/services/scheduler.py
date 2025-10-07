@@ -1,6 +1,7 @@
 import logging
 import asyncio
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 import schedule
 import time
@@ -98,9 +99,12 @@ class SchedulerService:
         
         # Schedule LMS sync every 30 minutes
         schedule.every(30).minutes.do(self._sync_lms_content)
-        
-        # Schedule document processing every 10 minutes
-        schedule.every(10).minutes.do(self._process_pending_documents)
+
+        # Schedule document processing every 2 minutes (more frequent for better responsiveness)
+        schedule.every(2).minutes.do(self._process_pending_documents)
+
+        # Also process documents immediately after sync
+        schedule.every(30).minutes.do(self._process_pending_documents)
         
         # Schedule daily cleanup at 2 AM
         schedule.every().day.at("02:00").do(self._daily_cleanup)
@@ -132,7 +136,10 @@ class SchedulerService:
             
             if stats['documents_synced'] > 0:
                 logger.info(f"LMS sync completed: {stats}")
-                
+
+                # Immediately trigger document processing for new documents
+                self._process_pending_documents()
+
                 # Send notifications for new documents
                 asyncio.create_task(self._notify_new_documents())
             else:
@@ -193,44 +200,73 @@ class SchedulerService:
             if not self.rag_pipeline:
                 logger.warning("RAG pipeline not available for document processing")
                 return
-            
+
             with db_manager.get_session() as session:
-                # Get pending documents (limit to 5 at a time to avoid overwhelming)
+                # Get pending documents (limit to 10 at a time for better throughput)
                 pending_docs = session.query(Document).filter(
                     Document.is_processed == False,
                     Document.processing_status == "pending"
-                ).limit(5).all()
-                
+                ).order_by(Document.created_at.desc()).limit(10).all()  # Process newest first
+
                 if not pending_docs:
-                    return
-                
+                    # Also check for documents that have been "processing" for too long
+                    stuck_cutoff = datetime.now() - timedelta(hours=1)  # Consider stuck after 1 hour
+
+                    stuck_docs = session.query(Document).filter(
+                        Document.is_processed == False,
+                        Document.processing_status == "processing",
+                        Document.updated_at <= stuck_cutoff
+                    ).limit(5).all()
+
+                    if stuck_docs:
+                        logger.info(f"Found {len(stuck_docs)} stuck processing documents, resetting to pending")
+                        for doc in stuck_docs:
+                            doc.processing_status = "pending"
+                        session.commit()
+                        pending_docs = stuck_docs
+                    else:
+                        return
+
                 logger.info(f"Processing {len(pending_docs)} pending documents...")
                 processed_count = 0
-                
+
                 for doc in pending_docs:
                     try:
-                        # Update status to processing
-                        doc.processing_status = "processing"
-                        session.commit()
-                        
-                        # Process document
-                        success = self.rag_pipeline.process_and_store_document(doc.id)
-                        
-                        if success:
-                            processed_count += 1
-                            logger.info(f"Successfully processed document: {doc.title}")
-                        else:
+                        # Verify file exists before processing
+                        if not doc.file_path or not Path(doc.file_path).exists():
+                            logger.warning(f"File not found for document {doc.title}: {doc.file_path}")
                             doc.processing_status = "failed"
                             session.commit()
-                            logger.error(f"Failed to process document: {doc.title}")
-                    
+                            continue
+
+                        # Update status to processing with timestamp
+                        doc.processing_status = "processing"
+                        doc.updated_at = datetime.now()
+                        session.commit()
+
+                        # Process document
+                        logger.info(f"Processing document: {doc.title} ({doc.file_type})")
+                        success = self.rag_pipeline.process_and_store_document(doc.id)
+
+                        if success:
+                            processed_count += 1
+                            logger.info(f"✅ Successfully processed document: {doc.title}")
+                        else:
+                            doc.processing_status = "failed"
+                            doc.updated_at = datetime.now()
+                            session.commit()
+                            logger.error(f"❌ Failed to process document: {doc.title}")
+
                     except Exception as e:
                         doc.processing_status = "failed"
+                        doc.updated_at = datetime.now()
                         session.commit()
-                        logger.error(f"Error processing document {doc.title}: {e}")
-                
+                        logger.error(f"❌ Error processing document {doc.title}: {e}", exc_info=True)
+
                 if processed_count > 0:
-                    logger.info(f"Document processing completed: {processed_count}/{len(pending_docs)} successful")
+                    logger.info(f"✅ Document processing completed: {processed_count}/{len(pending_docs)} successful")
+                else:
+                    logger.info(f"❌ Document processing completed: 0/{len(pending_docs)} successful")
         
         except Exception as e:
             logger.error(f"Error in document processing task: {e}")
@@ -304,15 +340,40 @@ class SchedulerService:
     def force_sync_now(self) -> Dict[str, Any]:
         """Force an immediate sync (useful for testing or manual triggers)"""
         try:
-            logger.info("Forcing immediate LMS sync...")
+            logger.info("🔄 Forcing immediate LMS sync...")
             stats = lms_service.sync_all_materials()
-            
-            # Trigger document processing
-            self._process_pending_documents()
-            
+
+            # Immediately trigger document processing multiple times to ensure all docs are processed
+            processed_docs = 0
+            max_attempts = 3  # Process up to 3 rounds
+
+            for attempt in range(max_attempts):
+                logger.info(f"🔄 Document processing attempt {attempt + 1}/{max_attempts}")
+                initial_pending = self._get_pending_document_count()
+
+                if initial_pending == 0:
+                    break
+
+                self._process_pending_documents()
+
+                final_pending = self._get_pending_document_count()
+                processed_this_round = initial_pending - final_pending
+                processed_docs += processed_this_round
+
+                logger.info(f"📊 Processed {processed_this_round} documents this round, {final_pending} still pending")
+
+                # If no progress was made, break
+                if processed_this_round == 0:
+                    break
+
+            # Get final processing stats
+            processing_stats = self._get_processing_stats()
+
             return {
                 'success': True,
                 'stats': stats,
+                'documents_processed': processed_docs,
+                'processing_stats': processing_stats,
                 'timestamp': datetime.now()
             }
         
@@ -371,6 +432,95 @@ class SchedulerService:
     def get_pending_notifications(self) -> List[Dict[str, Any]]:
         """Get pending notifications (for the bot to process)"""
         return self.notification_service.get_pending_notifications()
+
+    def _get_pending_document_count(self) -> int:
+        """Get count of pending documents"""
+        try:
+            with db_manager.get_session() as session:
+                return session.query(Document).filter(
+                    Document.is_processed == False,
+                    Document.processing_status == "pending"
+                ).count()
+        except Exception as e:
+            logger.error(f"Error getting pending document count: {e}")
+            return 0
+
+    def _get_processing_stats(self) -> Dict[str, int]:
+        """Get comprehensive document processing statistics"""
+        try:
+            with db_manager.get_session() as session:
+                total = session.query(Document).count()
+                processed = session.query(Document).filter(Document.is_processed == True).count()
+                pending = session.query(Document).filter(
+                    Document.is_processed == False,
+                    Document.processing_status == "pending"
+                ).count()
+                processing = session.query(Document).filter(
+                    Document.processing_status == "processing"
+                ).count()
+                failed = session.query(Document).filter(
+                    Document.processing_status == "failed"
+                ).count()
+
+                return {
+                    'total': total,
+                    'processed': processed,
+                    'pending': pending,
+                    'processing': processing,
+                    'failed': failed,
+                    'success_rate': f"{(processed/total*100):.1f}%" if total > 0 else "0%"
+                }
+        except Exception as e:
+            logger.error(f"Error getting processing stats: {e}")
+            return {'error': str(e)}
+
+    def force_process_documents(self) -> Dict[str, Any]:
+        """Force immediate document processing without LMS sync"""
+        try:
+            logger.info("🔄 Forcing immediate document processing...")
+
+            initial_stats = self._get_processing_stats()
+            processed_docs = 0
+            max_attempts = 5  # Process up to 5 rounds
+
+            for attempt in range(max_attempts):
+                logger.info(f"🔄 Document processing attempt {attempt + 1}/{max_attempts}")
+                initial_pending = self._get_pending_document_count()
+
+                if initial_pending == 0:
+                    logger.info("✅ No pending documents to process")
+                    break
+
+                self._process_pending_documents()
+
+                final_pending = self._get_pending_document_count()
+                processed_this_round = initial_pending - final_pending
+                processed_docs += processed_this_round
+
+                logger.info(f"📊 Processed {processed_this_round} documents this round, {final_pending} still pending")
+
+                # If no progress was made, break
+                if processed_this_round == 0:
+                    logger.warning(f"⚠️ No progress in round {attempt + 1}, stopping")
+                    break
+
+            final_stats = self._get_processing_stats()
+
+            return {
+                'success': True,
+                'documents_processed': processed_docs,
+                'initial_stats': initial_stats,
+                'final_stats': final_stats,
+                'timestamp': datetime.now()
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Error during forced document processing: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'timestamp': datetime.now()
+            }
 
 # Global scheduler instance
 scheduler_service = SchedulerService()

@@ -5,7 +5,7 @@
 #python-telegram-bot==20.7
 #telegram==0.0.1
 
-# Web Framework
+# Web Framework --mostly for oauth server
 #fastapi==0.104.1
 #uvicorn==0.24.0
 
@@ -37,9 +37,14 @@
 #nltk==3.8.1
 #spacy==3.7.2
 
-#For moodle HTTP and API I installed
+#For model (and further document processing), I installed
+#mammoth
+#pdfplumber
+
+#For (moodle and HuggingFace) HTTP and API I installed
 #requests==2.31.0
 #urllib3==2.1.0
+#httpx
 
 # Scheduling I installed
 #schedule==1.2.0
@@ -49,13 +54,11 @@
 faiss-cpu==1.7.4
 scikit-learn==1.3.2
 
-# Document Processing
-pdfplumber==0.10.3
-
 # Utilities
 python-dotenv==1.0.0
 requests==2.31.0
 pandas==2.0.3
+huggingface_hub==0.35.0
 
 # Logging & Monitoring
 loguru==0.7.2

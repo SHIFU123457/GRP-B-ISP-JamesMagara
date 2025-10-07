@@ -26,6 +26,7 @@ class UserOAuthManager:
     SCOPES = [
         'https://www.googleapis.com/auth/classroom.courses.readonly',
         'https://www.googleapis.com/auth/classroom.student-submissions.students.readonly',
+        'https://www.googleapis.com/auth/classroom.rosters.readonly',
         'https://www.googleapis.com/auth/drive.readonly'
     ]
     
@@ -75,8 +76,16 @@ class UserOAuthManager:
             if not parsed:
                 logger.error("Invalid or expired OAuth state")
                 return False
+
             user_id = parsed['user_id']
             logger.info(f"Extracted user_id: {user_id} from state")
+
+            # Verify user exists in database
+            with db_manager.get_session() as session:
+                user = session.query(User).filter(User.id == user_id).first()
+                if not user:
+                    logger.error(f"User {user_id} not found in database during OAuth completion")
+                    return False
 
             # Recreate flow for token exchange
             logger.info(f"Creating flow with credentials file: {self.credentials_file}")
@@ -155,8 +164,12 @@ class UserOAuthManager:
         try:
             with db_manager.get_session() as session:
                 user = session.query(User).filter(User.id == user_id).first()
-                if not user or not user.google_credentials:
-                    logger.info(f"No credentials found for user {user_id}")
+                if not user:
+                    logger.warning(f"User {user_id} not found in database")
+                    return None
+
+                if not user.google_credentials:
+                    logger.info(f"No Google credentials stored for user {user_id}")
                     return None
                 
                 # Deserialize credentials with better error handling
@@ -189,12 +202,23 @@ class UserOAuthManager:
                 # Refresh if needed
                 if credentials.expired and credentials.refresh_token:
                     try:
+                        logger.info(f"Refreshing expired credentials for user {user_id}")
                         credentials.refresh(Request())
                         # Update stored credentials
                         self._store_user_credentials(user_id, credentials)
+                        logger.info(f"Successfully refreshed credentials for user {user_id}")
                     except Exception as refresh_err:
                         logger.error(f"Failed to refresh credentials for user {user_id}: {refresh_err}")
+                        # Mark user as disconnected if refresh fails
+                        user.google_classroom_connected = False
+                        session.commit()
                         return None
+                elif credentials.expired and not credentials.refresh_token:
+                    logger.warning(f"Credentials expired for user {user_id} but no refresh token available")
+                    # Mark user as disconnected
+                    user.google_classroom_connected = False
+                    session.commit()
+                    return None
                 
                 return credentials
                 
@@ -251,15 +275,29 @@ class UserGoogleClassroomConnector:
         """Authenticate this user's Google Classroom access"""
         try:
             self.credentials = self.oauth_manager.get_user_credentials(self.user_id)
-            
+
             if not self.credentials:
+                logger.warning(f"No valid credentials available for user {self.user_id}")
                 return False
-            
+
+            if self.credentials.expired:
+                logger.warning(f"Credentials expired for user {self.user_id}")
+                return False
+
             # Build services
+            logger.info(f"Building Google API services for user {self.user_id}")
             self.service = build('classroom', 'v1', credentials=self.credentials)
             self.drive_service = build('drive', 'v3', credentials=self.credentials)
-            
-            return True
+
+            # Test the connection with a simple API call
+            try:
+                # Test with courses list - this uses the courses.readonly scope we already have
+                test_result = self.service.courses().list(pageSize=1).execute()
+                logger.info(f"Successfully authenticated user {self.user_id}")
+                return True
+            except Exception as api_error:
+                logger.error(f"Google API test failed for user {self.user_id}: {api_error}")
+                return False
             
         except Exception as e:
             logger.error(f"Failed to authenticate user {self.user_id}: {e}")
@@ -305,8 +343,28 @@ class UserGoogleClassroomConnector:
     
     def is_authenticated(self) -> bool:
         """Check if user has valid authentication"""
-        credentials = self.oauth_manager.get_user_credentials(self.user_id)
-        return credentials is not None and not credentials.expired
+        try:
+            credentials = self.oauth_manager.get_user_credentials(self.user_id)
+            if credentials is None:
+                return False
+
+            if credentials.expired:
+                logger.info(f"Credentials expired for user {self.user_id}")
+                return False
+
+            # Double-check with a minimal API call
+            if self.service:
+                try:
+                    self.service.courses().list(pageSize=1).execute()
+                    return True
+                except Exception:
+                    logger.warning(f"API validation failed for user {self.user_id}")
+                    return False
+
+            return True
+        except Exception as e:
+            logger.error(f"Error checking authentication for user {self.user_id}: {e}")
+            return False
 
 # Updated bot handlers to support per-user OAuth
 class GoogleClassroomOAuthHandlers:
