@@ -27,7 +27,10 @@ class UserOAuthManager:
         'https://www.googleapis.com/auth/classroom.courses.readonly',
         'https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly',
         'https://www.googleapis.com/auth/classroom.rosters.readonly',
-        'https://www.googleapis.com/auth/drive.readonly'
+        'https://www.googleapis.com/auth/classroom.coursework.me.readonly',
+        'https://www.googleapis.com/auth/classroom.announcements.readonly',  # Access announcements
+        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/gmail.readonly'  # For monitoring Classroom notifications
     ]
     
     def __init__(self, credentials_file_path: str, redirect_uri: str):
@@ -112,7 +115,15 @@ class UserOAuthManager:
 
             try:
                 # Make direct request to token endpoint
+                logger.info(f"Token exchange request - redirect_uri: {flow.redirect_uri}")
                 response = requests.post(token_url, data=token_data)
+
+                # Log detailed error if request fails
+                if response.status_code != 200:
+                    logger.error(f"Token exchange failed with status {response.status_code}")
+                    logger.error(f"Response: {response.text}")
+                    logger.error(f"Redirect URI used: {flow.redirect_uri}")
+
                 response.raise_for_status()
                 token_response = response.json()
 

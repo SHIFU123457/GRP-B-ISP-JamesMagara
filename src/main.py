@@ -59,7 +59,7 @@ def test_database_connection():
         logger.error(f"Database connection failed: {e}")
         return False
 
-def setup_signal_handlers(bot, scheduler_service):
+def setup_signal_handlers(scheduler_service):
     """Setup signal handlers for graceful shutdown"""
     def signal_handler(signum, frame):
         logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
@@ -70,15 +70,10 @@ def setup_signal_handlers(bot, scheduler_service):
         except Exception as e:
             logger.error(f"Error stopping scheduler: {e}")
 
-        try:
-            if bot:
-                bot.stop()
-                logger.info("Bot stopped")
-        except Exception as e:
-            logger.error(f"Error stopping bot: {e}")
-
-        logger.info("Graceful shutdown completed")
-        sys.exit(0)
+        logger.info("Graceful shutdown initiated - waiting for async cleanup...")
+        # Don't call sys.exit() - let the async bot cleanup happen naturally
+        # Just raise KeyboardInterrupt to trigger the except block in main()
+        raise KeyboardInterrupt()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -156,17 +151,18 @@ def main():
         logger.info("✅ Bot initialized successfully")
 
         # Setup signal handlers for graceful shutdown
-        setup_signal_handlers(bot, scheduler_service)
+        setup_signal_handlers(scheduler_service)
 
         # Start the bot
         logger.info("🎆 Study Helper Agent is now running!")
-        asyncio.run(bot.run())
 
-    except KeyboardInterrupt:
-        logger.info("❌ Received keyboard interrupt. Shutting down...")
+        try:
+            asyncio.run(bot.run())
+        except KeyboardInterrupt:
+            logger.info("❌ Received keyboard interrupt. Shutting down...")
+
     except Exception as e:
         logger.error(f"❌ Unexpected error in main: {e}", exc_info=True)
-        sys.exit(1)
     finally:
         logger.info("💯 Performing cleanup...")
         try:
@@ -175,13 +171,6 @@ def main():
                 logger.info("✅ Scheduler stopped")
         except Exception as e:
             logger.error(f"❌ Error stopping scheduler: {e}")
-
-        try:
-            if bot:
-                bot.stop()
-                logger.info("✅ Bot stopped")
-        except Exception as e:
-            logger.error(f"❌ Error stopping bot: {e}")
 
         logger.info("👋 Study Helper Agent stopped")
 

@@ -20,7 +20,7 @@ from config.settings import settings
 #For RAG functionality
 from src.core.rag_pipeline import RAGPipeline
 #For LMS integration functionality
-from src.services.scheduler import scheduler_service
+from src.services.scheduler import scheduler_service, escape_markdown
 from src.services.lms_integration import lms_service
 from src.data.models import User, UserInteraction, PersonalizationProfile, Course, Document, CourseEnrollment
 
@@ -73,6 +73,9 @@ class StudyHelperBot:
         try:
             notifications = scheduler_service.get_pending_notifications()
 
+            if not notifications:
+                return
+
             for notification in notifications:
                 try:
                     # Check if this is an interactive notification
@@ -84,16 +87,21 @@ class StudyHelperBot:
                         await context.bot.send_message(
                             chat_id=notification['user_telegram_id'],
                             text=notification['message'],
-                            reply_markup=reply_markup
+                            reply_markup=reply_markup,
+                            parse_mode='Markdown'
                         )
                         logger.info(f"📤 Sent interactive {notification.get('material_type', 'unknown')} notification to user {notification['user_telegram_id']}")
                     else:
                         # Regular notification without buttons
                         await context.bot.send_message(
                             chat_id=notification['user_telegram_id'],
-                            text=notification['message']
+                            text=notification['message'],
+                            parse_mode='Markdown'
                         )
                         logger.info(f"📤 Sent notification to user {notification['user_telegram_id']}")
+
+                    # Clear notification after successful send
+                    scheduler_service.notification_service.clear_notification(notification)
 
                 except Exception as e:
                     logger.error(f"❌ Failed to send notification to {notification['user_telegram_id']}: {e}")
@@ -275,24 +283,26 @@ Please check the LMS connection or try again later.
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
         try:
-            status = scheduler_service.get_sync_status()
+            # Get user-specific status
+            user_telegram_id = str(update.message.from_user.id)
+            status = scheduler_service.get_sync_status(user_telegram_id=user_telegram_id)
 
             status_text = f"""
-📊 **System Status**
+📊 **Your Study Status**
 
 **Scheduler:** {'🟢 Running' if status['running'] else '🔴 Stopped'}
 **Connected LMS:** {', '.join(status['connected_platforms']) if status['connected_platforms'] else 'None'}
 **RAG Pipeline:** {'🟢 Available' if status['rag_available'] else '🔴 Not Available'}
 
-**Documents:**
+**Your Documents:**
 • Total: {status['documents']['total']}
 • Processed: {status['documents']['processed']} ✅
 • Pending: {status['documents']['pending']} ⏳
 • Processing: {status['documents']['processing']} 🔄
 • Failed: {status['documents']['failed']} ❌
 
-**Courses:**
-• Total: {status['courses']['total']}
+**Your Courses:**
+• Enrolled: {status['courses']['total']}
 • Active: {status['courses']['active']}
 
 **Last Update:** {status['last_update'].strftime('%Y-%m-%d %H:%M:%S')}
@@ -495,15 +505,22 @@ Try /connect_classroom again if the issue persists.
                     else:
                         course_list = []
                         for course in google_courses:
+                            # Escape special HTML characters
+                            import html
+                            course_name = html.escape(course.get('name', 'Unnamed Course'))
+                            course_id = html.escape(str(course.get('id', 'N/A')))
+                            course_section = html.escape(str(course.get('section', 'N/A')))
+                            course_desc = html.escape(str(course.get('descriptionHeading', 'N/A')))
+
                             course_list.append(
-                                f"📋 **{course.get('name', 'Unnamed Course')}**\n"
-                                f"   • ID: {course.get('id', 'N/A')}\n"
-                                f"   • Section: {course.get('section', 'N/A')}\n"
-                                f"   • Description: {course.get('descriptionHeading', 'N/A')}"
+                                f"📋 <b>{course_name}</b>\n"
+                                f"   • ID: {course_id}\n"
+                                f"   • Section: {course_section}\n"
+                                f"   • Description: {course_desc}"
                             )
 
                         courses_text = f"""
-📚 **Your Google Classroom Courses**
+📚 <b>Your Google Classroom Courses</b>
 
 {chr(10).join(course_list)}
 
@@ -513,7 +530,7 @@ These are your live Google Classroom courses. Use /sync to download course mater
                 except Exception as gc_error:
                     logger.error(f"Error fetching Google Classroom courses: {gc_error}")
                     courses_text = """
-📚 **Your Courses**
+📚 <b>Your Courses</b>
 
 Failed to fetch courses from Google Classroom. This might be due to:
 • Network connectivity issues
@@ -529,7 +546,11 @@ Try /connect_classroom again to refresh your connection.
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
-                await update.message.reply_text(courses_text, reply_markup=reply_markup, parse_mode='Markdown')
+                # Log the message for debugging
+                logger.debug(f"Courses text to send (length={len(courses_text)}): {courses_text[:300]}")
+
+                # Send with HTML parse mode (more forgiving than Markdown)
+                await update.message.reply_text(courses_text, reply_markup=reply_markup, parse_mode='HTML')
 
         except Exception as e:
             logger.error(f"Error in courses_command: {e}", exc_info=True)
@@ -937,7 +958,7 @@ Choose a setting to modify:
             action = "_".join(parts[:-1])  # e.g., "help_assignment", "summarize_reading"
             document_id = parts[-1]
 
-            # Get document details
+            # Get document details (cache values before session closes)
             with db_manager.get_session() as session:
                 from src.data.models import Document
                 document = session.query(Document).filter(Document.id == document_id).first()
@@ -952,11 +973,17 @@ Choose a setting to modify:
                     await query.edit_message_text("❌ Please use /start first to create your profile.")
                     return
 
+                # Cache values before session closes
+                doc_title = document.title
+                doc_id = document.id
+                user_telegram_id = user.telegram_id
+                user_id = user.id
+
             # Update the message to show we're working on it
-            await query.edit_message_text(f"🤖 **Working on your request...**\n\n📄 *{document.title}*\n\n⏳ Please wait while I analyze the material...")
+            await query.edit_message_text(f"🤖 **Working on your request...**\n\n📄 *{escape_markdown(doc_title)}*\n\n⏳ Please wait while I analyze the material...")
 
             # Generate appropriate response based on the action
-            response = await self._generate_material_response(action, document, user)
+            response = await self._generate_material_response(action, doc_id, doc_title, user_id)
 
             # Send the response (split if too long)
             response_parts = self._split_long_message(response)
@@ -968,52 +995,58 @@ Choose a setting to modify:
             for part in response_parts[1:]:
                 await context.bot.send_message(chat_id=query.message.chat_id, text=part)
 
-            logger.info(f"📤 Handled {action} request for document {document.title} by user {user.telegram_id}")
+            logger.info(f"📤 Handled {action} request for document {doc_title} by user {user_telegram_id}")
 
         except Exception as e:
             logger.error(f"❌ Error handling material assistance: {e}")
             await query.edit_message_text("❌ Sorry, something went wrong while processing your request. Please try again.")
 
-    async def _generate_material_response(self, action: str, document: Document, user: User) -> str:
+    async def _generate_material_response(self, action: str, doc_id: int, doc_title: str, user_id: int) -> str:
         """Generate appropriate response based on the requested action"""
         try:
             # Create context-aware queries based on the action
             if action == "help_assignment":
-                query = f"Help me understand and complete the assignment '{document.title}'. What are the main requirements and how should I approach it?"
+                query = f"Help me understand and complete the assignment '{doc_title}'. What are the main requirements and how should I approach it?"
             elif action == "breakdown_assignment":
-                query = f"Break down the assignment '{document.title}' into smaller, manageable tasks. What steps should I follow?"
+                query = f"Break down the assignment '{doc_title}' into smaller, manageable tasks. What steps should I follow?"
             elif action == "explain_assignment":
-                query = f"Explain the requirements and expectations for the assignment '{document.title}'. What exactly am I supposed to do?"
+                query = f"Explain the requirements and expectations for the assignment '{doc_title}'. What exactly am I supposed to do?"
             elif action == "study_quiz":
-                query = f"Help me prepare for the quiz/test '{document.title}'. What topics should I focus on studying?"
+                query = f"Help me prepare for the quiz/test '{doc_title}'. What topics should I focus on studying?"
             elif action == "practice_quiz":
-                query = f"Create practice questions based on the material in '{document.title}' to help me prepare."
+                query = f"Create practice questions based on the material in '{doc_title}' to help me prepare."
             elif action == "concepts_quiz":
-                query = f"What are the key concepts and topics I should understand for '{document.title}'?"
+                query = f"What are the key concepts and topics I should understand for '{doc_title}'?"
             elif action == "summarize_reading":
-                query = f"Provide a comprehensive summary of the key points in '{document.title}'"
+                query = f"Provide a comprehensive summary of '{doc_title}'"
             elif action == "questions_reading":
-                query = f"I have questions about the content in '{document.title}'. Can you help me understand it better?"
+                query = f"I have questions about the content in '{doc_title}'. Can you help me understand it better?"
             elif action == "keypoints_reading":
-                query = f"What are the main key points and important concepts in '{document.title}'?"
+                query = f"What are the main key points and important concepts in '{doc_title}'?"
             else:
-                query = f"Help me understand the content in '{document.title}'"
+                query = f"Help me understand the content in '{doc_title}'"
 
-            # Use the RAG pipeline to get a contextual response
-            if self.rag_pipeline:
-                response = await self._process_query_rag_enhanced(query, user)
+            # Load user with fresh session
+            with db_manager.get_session() as session:
+                user = session.query(User).filter(User.id == user_id).first()
+                if not user:
+                    return "❌ User not found"
 
-                # Add a helpful header
-                if action.startswith("help_assignment"):
-                    header = "📝 **Assignment Help**\n\n"
-                elif action.startswith("study_quiz") or action.startswith("practice_quiz") or action.startswith("concepts_quiz"):
-                    header = "🧠 **Study Assistance**\n\n"
+                # Use the RAG pipeline to get a contextual response
+                if self.rag_pipeline:
+                    response = await self._process_query_rag_enhanced(query, user, document_id=doc_id)
+
+                    # Add a helpful header
+                    if action.startswith("help_assignment"):
+                        header = "📝 **Assignment Help**\n\n"
+                    elif action.startswith("study_quiz") or action.startswith("practice_quiz") or action.startswith("concepts_quiz"):
+                        header = "🧠 **Study Assistance**\n\n"
+                    else:
+                        header = "📖 **Material Summary**\n\n"
+
+                    return header + response
                 else:
-                    header = "📖 **Material Summary**\n\n"
-
-                return header + response
-            else:
-                return "❌ Sorry, I'm currently unable to process your request. The content analysis system is not available."
+                    return "❌ Sorry, I'm currently unable to process your request. The content analysis system is not available."
 
         except Exception as e:
             logger.error(f"❌ Error generating material response: {e}")
@@ -1021,28 +1054,49 @@ Choose a setting to modify:
 
 
 
-    async def _process_query_rag_enhanced(self, query: str, user: User) -> str:
+    async def _process_query_rag_enhanced(self, query: str, user: User, document_id: Optional[int] = None) -> str:
         """Enhanced query processing with RAG pipeline and LLM integration"""
         if not self.rag_pipeline:
             logger.error("RAG pipeline not initialized")
             return await self._process_query_basic(query, user)  # Fallback to basic
-        
+
         try:
+            # If document_id not provided, try to extract it from query
+            searched_doc_title = None
+            if not document_id:
+                document_id = self._extract_document_from_query(query, user)
+                # Check if we searched for a document but didn't find it
+                if hasattr(self, '_last_searched_doc_title'):
+                    searched_doc_title = self._last_searched_doc_title
+                    delattr(self, '_last_searched_doc_title')
+
             # Determine course context from query
-            course_id = self._extract_course_context(query, user)
-            
+            # Priority: document_id > no filter (search all)
+            # Course filtering disabled because many enrolled courses have no documents
+            course_id = None
+            if not document_id:
+                # If user explicitly mentioned a document that wasn't found,
+                # don't filter by course - search all documents for related content
+                if searched_doc_title:
+                    logger.info(f"Document '{searched_doc_title}' not found - searching ALL documents without course filter")
+                else:
+                    # Always search all documents - don't restrict by course
+                    # This ensures we find relevant content even if user's active course is empty
+                    logger.info(f"No specific document - searching ALL documents (course filter disabled for better coverage)")
+
             # Get user preferences for personalization
             user_preferences = {
                 'learning_style': user.learning_style,
                 'difficulty_preference': user.difficulty_preference,
                 'response_length': getattr(user, 'preferred_response_length', 'medium')
             }
-            
+
             # Generate RAG response using the enhanced pipeline
             rag_result = self.rag_pipeline.generate_rag_response(
-                query, 
-                course_id, 
-                user_preferences
+                query,
+                course_id=course_id,
+                document_id=document_id,
+                user_preferences=user_preferences
             )
             
             # Format the response with sources and confidence indicator
@@ -1055,37 +1109,10 @@ Choose a setting to modify:
             return await self._process_query_basic(query, user)
         
     def _format_rag_response(self, rag_result: Dict[str, Any], user: User) -> str:
-        """Format RAG response with sources and confidence indicators"""
-        response_parts = []
-        
-        # Add the main response
-        main_response = rag_result['response']
-        if main_response:
-            response_parts.append(main_response)
-        
-        # Add sources if context was used
-        if rag_result.get('context_used', False) and rag_result.get('sources'):
-            response_parts.append("\n**📚 Sources from your course materials:**")
-            
-            for i, source in enumerate(rag_result['sources'][:3], 1):  # Show max 3 sources
-                confidence_emoji = self._get_confidence_emoji(source['similarity_score'])
-                response_parts.append(
-                    f"{i}. {source['title']} ({source['course_code']}) {confidence_emoji}"
-                )
-            
-            if len(rag_result['sources']) > 3:
-                response_parts.append(f"*...and {len(rag_result['sources']) - 3} more sources*")
-        
-        # Add confidence and personalization note
-        confidence = rag_result.get('confidence', 'medium')
-        if confidence == 'high':
-            response_parts.append(f"\n*High confidence response tailored for {user.learning_style} learning style.*")
-        elif confidence == 'medium':
-            response_parts.append(f"\n*Response based on course materials (medium confidence).*")
-        else:
-            response_parts.append(f"\n*Limited course material found. Consider using /sync to update materials.*")
-        
-        return "\n".join(response_parts)
+        """Format RAG response - sources already added by RAG pipeline, just add confidence emoji"""
+        # The response already includes sources formatted by _enhance_response_with_sources()
+        # Don't duplicate the sources section, just return the response
+        return rag_result['response']
 
     def _get_confidence_emoji(self, similarity_score: float) -> str:
         """Get emoji indicating confidence level"""
@@ -1096,6 +1123,59 @@ Choose a setting to modify:
         else:
             return "📝"  # Low confidence
 
+
+    def _extract_document_from_query(self, query: str, user: User) -> Optional[int]:
+        """Extract document ID from query by matching document titles"""
+        try:
+            # Look for common document reference patterns
+            import re
+
+            # Patterns to match document references (with or without quotes)
+            patterns = [
+                r"(?:document|material|file|pdf|pptx)\s+['\"]([^'\"]+)['\"]",  # "document 'name'"
+                r"(?:in|from|about|named|called|regards)\s+(?:the\s+)?(?:document|material|file)?\s*['\"]([^'\"]+)['\"]",  # "about 'name'"
+                r"['\"]([^'\"]+\.(?:pdf|pptx|docx|txt))['\"]",  # "'filename.ext'"
+                r"['\"]([^'\"]+)['\"]"  # any quoted text
+            ]
+
+            potential_titles = []
+            for pattern in patterns:
+                matches = re.findall(pattern, query, re.IGNORECASE)
+                potential_titles.extend(matches)
+
+            # Remove duplicates while preserving order
+            potential_titles = list(dict.fromkeys(potential_titles))
+
+            if potential_titles:
+                logger.info(f"Extracted potential document titles from query: {potential_titles}")
+
+            # Search for matching documents in database
+            with db_manager.get_session() as session:
+                for title in potential_titles:
+                    # Skip very short titles (likely false positives)
+                    if len(title.strip()) < 3:
+                        continue
+
+                    # Try exact match first
+                    doc = session.query(Document).filter(
+                        Document.title.ilike(f"%{title}%")
+                    ).first()
+
+                    if doc:
+                        logger.info(f"✓ Found document '{doc.title}' (ID: {doc.id}, course_id: {doc.course_id})")
+                        return doc.id
+
+                # If we searched but found nothing, store the title for fallback handling
+                if potential_titles:
+                    logger.warning(f"✗ Document not found for title: '{potential_titles[0]}'")
+                    logger.info(f"→ Will search ALL documents (no course filter) for related content")
+                    # Store in instance variable for the calling method to detect
+                    self._last_searched_doc_title = potential_titles[0]
+
+        except Exception as e:
+            logger.warning(f"Error extracting document from query: {e}")
+
+        return None
 
     def _extract_course_context(self, query: str, user: User) -> Optional[int]:
         """Extract course context from query"""
@@ -1456,15 +1536,40 @@ Use /help for available commands!
             logger.error(f"Failed to send error message to user: {send_error}")
     
     async def run(self):
-        """Start the bot"""
+        """Start the bot and keep it running"""
         logger.info("Starting Study Helper Agent bot...")
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling()
-        await self.application.updater.idle()
-    
-    def stop(self):
-        """Stop the bot"""
-        if self.application:
-            self.application.stop()
-            logger.info("Bot stopped")
+
+        # Set event loop for scheduler
+        from src.services.scheduler import scheduler_service
+        import asyncio
+        scheduler_service.set_event_loop(asyncio.get_running_loop())
+
+        try:
+            # Initialize and start the application
+            await self.application.initialize()
+            await self.application.start()
+
+            # Start polling for updates
+            await self.application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False
+            )
+
+            logger.info("Bot is running. Press Ctrl+C to stop.")
+
+            # Keep running until interrupted
+            stop_event = asyncio.Event()
+
+            # Wait forever (until Ctrl+C)
+            await stop_event.wait()
+
+        except asyncio.CancelledError:
+            logger.info("Bot run cancelled")
+        finally:
+            # Cleanup
+            logger.info("Stopping bot...")
+            if self.application.updater.running:
+                await self.application.updater.stop()
+            await self.application.stop()
+            await self.application.shutdown()
+            logger.info("Bot stopped successfully")

@@ -26,12 +26,15 @@ class DatabaseManager:
     def _initialize(self):
         """Initialize database connection"""
         try:
-            # Create engine with connection pooling
+            # Create engine with connection pooling configured for Supabase (free-tier) limits
             self._engine = create_engine(
                 settings.DATABASE_URL,
                 echo=settings.DEBUG,  # Log SQL queries in debug mode
                 pool_pre_ping=True,  # Verify connections before use
                 pool_recycle=300,    # Recycle connections every 5 minutes
+                pool_size=3,         # Max 3 persistent connections (Supabase has ~15 max)
+                max_overflow=2,      # Allow 2 additional connections temporarily (total max: 5)
+                pool_timeout=30,     # Wait up to 30s for a connection
             )
             
             # Create session factory
@@ -169,7 +172,26 @@ class DatabaseManager:
                     with self._engine.begin() as conn:
                         conn.execute(text("ALTER TABLE documents ADD COLUMN access_level VARCHAR DEFAULT 'enrolled'"))
                     logger.info("Successfully added access_level column to documents table")
-                    
+
+                # Notification tracking columns (Phase 1 - Hybrid Approach)
+                if 'notification_sent' not in columns:
+                    logger.info("Adding notification_sent column to documents table")
+                    with self._engine.begin() as conn:
+                        conn.execute(text("ALTER TABLE documents ADD COLUMN notification_sent BOOLEAN DEFAULT FALSE"))
+                    logger.info("Successfully added notification_sent column to documents table")
+
+                if 'notification_sent_at' not in columns:
+                    logger.info("Adding notification_sent_at column to documents table")
+                    with self._engine.begin() as conn:
+                        conn.execute(text("ALTER TABLE documents ADD COLUMN notification_sent_at TIMESTAMP WITH TIME ZONE"))
+                    logger.info("Successfully added notification_sent_at column to documents table")
+
+                if 'material_type' not in columns:
+                    logger.info("Adding material_type column to documents table")
+                    with self._engine.begin() as conn:
+                        conn.execute(text("ALTER TABLE documents ADD COLUMN material_type VARCHAR"))
+                    logger.info("Successfully added material_type column to documents table")
+
             logger.info("Schema migration completed successfully")
             
         except Exception as e:

@@ -183,7 +183,7 @@ class RAGPipeline:
             return False
     
     @retry_with_backoff(max_retries=2, base_delay=0.5)
-    def retrieve_relevant_chunks(self, query: str, course_id: Optional[int] = None, top_k: int = None) -> List[Dict[str, Any]]:
+    def retrieve_relevant_chunks(self, query: str, course_id: Optional[int] = None, document_id: Optional[int] = None, top_k: int = None) -> List[Dict[str, Any]]:
         """Retrieve most relevant chunks for a given query"""
         try:
             # Use configured top_k if not specified
@@ -196,20 +196,27 @@ class RAGPipeline:
             logger.info(f"Query embedding shape: {len(query_embedding)}")
             logger.info(f"Query embedding sample: {query_embedding[:5]}")  # First 5 values
 
-            # Prepare filter for course-specific search
+            # Prepare filter for document/course-specific search
             where_filter = {}
-            if course_id:
+            if document_id:
+                where_filter["document_id"] = document_id
+                logger.info(f"Filtering by document_id: {document_id}")
+            elif course_id:
                 where_filter["course_id"] = course_id
+                logger.info(f"Filtering by course_id: {course_id}")
 
-            # Search in ChromaDB - temporarily remove where filter to debug
+            # Search in ChromaDB with where filter
             try:
                 results = self.collection.query(
                     query_embeddings=[query_embedding],
                     n_results=top_k,
-                    # where=where_filter if where_filter else None,  # Temporarily disabled
+                    where=where_filter if where_filter else None,
                     include=['documents', 'metadatas', 'distances']
                 )
-                logger.info(f"ChromaDB query successful - where filter disabled for debugging")
+                if where_filter:
+                    logger.info(f"ChromaDB query successful - filtered by {where_filter}")
+                else:
+                    logger.info(f"ChromaDB query successful - no filters applied")
             except Exception as query_error:
                 logger.error(f"ChromaDB query failed: {query_error}")
                 return []
@@ -290,7 +297,7 @@ class RAGPipeline:
             logger.error(f"Error retrieving relevant chunks: {e}")
             return []
     
-    def generate_context(self, query: str, course_id: Optional[int] = None, max_context_length: Optional[int] = None) -> Dict[str, Any]:
+    def generate_context(self, query: str, course_id: Optional[int] = None, document_id: Optional[int] = None, max_context_length: Optional[int] = None) -> Dict[str, Any]:
         """Generate enhanced context for RAG-enhanced response with better source integration"""
         try:
             # Use configurable context length
@@ -298,7 +305,7 @@ class RAGPipeline:
                 max_context_length = settings.CONTEXT_MAX_LENGTH
 
             # Retrieve relevant chunks with higher similarity threshold for better quality
-            relevant_chunks = self.retrieve_relevant_chunks(query, course_id, top_k=settings.TOP_K_RETRIEVAL)
+            relevant_chunks = self.retrieve_relevant_chunks(query, course_id, document_id, top_k=settings.TOP_K_RETRIEVAL)
 
             if not relevant_chunks:
                 return {
@@ -367,113 +374,28 @@ class RAGPipeline:
                 'has_relevant_content': False
             }
    
-    def _is_educational_query(self, query: str) -> bool:
-        """Determine if query is education-related and should use course materials"""
+    def _is_obvious_chitchat(self, query: str) -> bool:
+        """Check if query is obvious chitchat/greetings that should skip RAG entirely"""
         query_lower = query.lower().strip()
 
-        # First check for clearly NON-educational topics that should use model directly
-        non_educational_topics = [
-            # Weather
-            'weather', 'rain', 'snow', 'sunny', 'cloudy', 'temperature', 'forecast',
-            'climate', 'storm', 'hurricane', 'tornado', 'cold', 'hot', 'warm',
+        # Only skip RAG for very obvious greetings and basic chitchat
+        chitchat_patterns = [
+            # Greetings
+            'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
+            'how are you', "what's up", 'whats up', 'sup',
 
-            # Religion/Philosophy/Beliefs
-            'god', 'religion', 'belief', 'faith', 'pray', 'church', 'mosque', 'temple',
-            'spiritual', 'soul', 'heaven', 'hell', 'afterlife', 'meaning of life',
+            # Basic questions about the bot
+            'who are you', 'what are you', 'your name',
 
-            # Personal/Social
-            'relationship', 'dating', 'love', 'marriage', 'family', 'friend', 'friendship',
-            'personal', 'emotion', 'feeling', 'happiness', 'sadness', 'depression',
-
-            # Entertainment
-            'movie', 'film', 'music', 'song', 'game', 'sport', 'football', 'basketball',
-            'celebrity', 'actor', 'actress', 'singer', 'artist', 'tv show', 'netflix',
-
-            # Current events/News
-            'news', 'politics', 'election', 'president', 'government', 'war', 'economy',
-            'stock market', 'bitcoin', 'cryptocurrency', 'current events',
-
-            # Health/Medical (non-academic)
-            'doctor', 'medicine', 'sick', 'disease', 'symptom', 'pain', 'headache',
-            'diet', 'exercise', 'weight', 'fitness',
-
-            # Technology (non-academic/consumer)
-            'iphone', 'android', 'smartphone', 'social media', 'facebook', 'twitter',
-            'instagram', 'tiktok', 'youtube', 'netflix',
-
-            # Food/Cooking
-            'recipe', 'cooking', 'food', 'restaurant', 'meal', 'dinner', 'lunch',
-            'breakfast', 'taste', 'delicious',
-
-            # Travel
-            'travel', 'vacation', 'hotel', 'flight', 'airport', 'tourist', 'destination',
-
-            # Shopping/Consumer
-            'buy', 'purchase', 'shop', 'price', 'cost', 'expensive', 'cheap',
-            'brand', 'product', 'store'
+            # Thank you / goodbye
+            'thank you', 'thanks', 'bye', 'goodbye', 'see you',
         ]
 
-        # Check for non-educational topics first
-        for topic in non_educational_topics:
-            if topic in query_lower:
-                return False  # Not educational, use model directly
-
-        # Educational keywords that indicate academic content
-        educational_keywords = [
-            # Academic subjects
-            'explain', 'definition', 'define', 'algorithm', 'concept',
-            'theory', 'principle', 'method', 'technique', 'process', 'procedure',
-
-            # Academic activities
-            'assignment', 'homework', 'project', 'exam', 'test', 'quiz', 'study', 'learn',
-            'understand', 'solve', 'calculate', 'analyze', 'compare', 'discuss',
-
-            # Course-related terms
-            'course', 'class', 'lecture', 'textbook', 'material', 'document', 'notes',
-            'chapter', 'section', 'topic', 'subject', 'syllabus',
-
-            # Specific academic domains (add more based on your courses)
-            'database', 'programming', 'computer science', 'mathematics', 'engineering',
-            'biology', 'chemistry', 'physics', 'statistics', 'data structure',
-            'sql', 'python', 'java', 'algorithm', 'software', 'putty', 'ssh',
-            'normalization', 'query', 'table', 'function', 'variable', 'loop',
-            'array', 'stack', 'queue', 'tree', 'graph', 'sorting', 'searching'
-        ]
-
-        # Direct references to documents/materials
-        document_references = [
-            'from my documents', 'in my materials', 'from the textbook',
-            'according to', 'based on the', 'from the course',
-            'in the assignment', 'from my notes', 'from my course'
-        ]
-
-        # Check for direct document references (always educational)
-        for ref in document_references:
-            if ref in query_lower:
+        # Check if query is just a greeting/chitchat
+        for pattern in chitchat_patterns:
+            if query_lower == pattern or query_lower.startswith(pattern + ' ') or query_lower.startswith(pattern + '?'):
                 return True
 
-        # Check for educational keywords
-        for keyword in educational_keywords:
-            if keyword in query_lower:
-                return True
-
-        # Special case for "what is" - only educational if it's about technical/academic topics
-        if 'what is' in query_lower:
-            # Extract what they're asking about
-            what_about = query_lower.split('what is')[-1].strip()
-            # If it contains educational terms, it's educational
-            for keyword in educational_keywords:
-                if keyword in what_about:
-                    return True
-
-        # Special case for "how to" - only educational if it's about technical/academic topics
-        if 'how to' in query_lower:
-            how_about = query_lower.split('how to')[-1].strip()
-            for keyword in educational_keywords:
-                if keyword in how_about:
-                    return True
-
-        # Default: if no clear educational indicators, treat as non-educational
         return False
 
     def _generate_non_educational_response(self, query: str, user_preferences: Dict[str, Any] = None) -> str:
@@ -487,51 +409,50 @@ class RAGPipeline:
             # Simple fallback if LLM fails
             return "I'm here to help with your studies! Feel free to ask me about your course materials or any academic topics."
 
-    def generate_rag_response(self, query: str, course_id: Optional[int] = None, user_preferences: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Generate complete RAG response using LLM with retrieved context"""
-        try:
-            # Check if this is an educational query that should use course materials
-            if not self._is_educational_query(query):
-                logger.info(f"Detected non-educational query: '{query[:50]}...' - using model without course materials")
+    def generate_rag_response(self, query: str, course_id: Optional[int] = None, document_id: Optional[int] = None, user_preferences: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Generate complete RAG response using LLM with retrieved context
 
-                # Use LLM to respond naturally to non-educational queries
-                non_educational_response = self._generate_non_educational_response(query, user_preferences)
+        Strategy: RAG-first approach
+        1. Check for obvious non-educational queries (greetings, chitchat)
+        2. Always attempt RAG retrieval for everything else
+        3. If similarity < 10%, fall back to generic LLM
+        """
+        try:
+            # Only skip RAG for obvious non-educational queries (greetings, chitchat)
+            if self._is_obvious_chitchat(query):
+                logger.info(f"Detected chitchat: '{query[:50]}...' - responding conversationally")
+
+                # Use LLM to respond naturally to chitchat
+                chitchat_response = self._generate_non_educational_response(query, user_preferences)
 
                 return {
-                    'response': non_educational_response,
+                    'response': chitchat_response,
                     'context_used': False,
                     'sources': [],
                     'confidence': 'high',
-                    'reason': 'non_educational_query'
+                    'reason': 'chitchat'
                 }
 
-            # Generate context from relevant documents for educational questions
-            logger.info(f"Detected educational query: '{query[:50]}...' - searching course materials")
-            context_data = self.generate_context(query, course_id)
+            # For all other queries: Always try RAG first
+            logger.info(f"Searching course materials for: '{query[:50]}...'")
+            context_data = self.generate_context(query, course_id, document_id)
 
-            if not context_data['has_relevant_content']:
-                # No relevant content found - provide simple guidance
-                no_context_response = f"""I couldn't find specific information about "{query}" in your uploaded course materials.
+            # Check if we have relevant content based on similarity threshold
+            avg_similarity = context_data.get('average_similarity', 0)
+            FALLBACK_THRESHOLD = 0.10  # 10% similarity threshold
 
-This might be because:
-- The topic hasn't been covered in uploaded materials yet
-- Different terminology is used in your course materials
-- The materials need to be processed (use /process_docs)
-- Your course materials need to be synced (use /sync)
+            if not context_data['has_relevant_content'] or avg_similarity < FALLBACK_THRESHOLD:
+                # Similarity too low - fall back to generic LLM
+                logger.info(f"Similarity {avg_similarity*100:.1f}% below threshold ({FALLBACK_THRESHOLD*100}%) - falling back to generic LLM")
 
-Suggestions:
-- Try rephrasing your question with terms from your textbook
-- Ask about topics from your enrolled courses
-- Check if your instructor has uploaded relevant materials
-
-I can provide general academic guidance, but for course-specific information, please ensure your materials are up to date."""
+                fallback_response = self._generate_non_educational_response(query, user_preferences)
 
                 return {
-                    'response': no_context_response,
+                    'response': fallback_response,
                     'context_used': False,
                     'sources': [],
                     'confidence': 'low',
-                    'reason': 'no_relevant_context'
+                    'reason': 'low_similarity_fallback'
                 }
 
             # Generate response using LLM with context
@@ -571,27 +492,24 @@ I can provide general academic guidance, but for course-specific information, pl
         if not context_data.get('sources'):
             return response
 
-        # Add source references to the response - simplified format to avoid Telegram parsing issues
-        sources_section = "\n\nCourse Material Sources:\n"
+        # Log detailed source information for developers
+        avg_similarity = context_data.get('average_similarity', 0)
+        logger.info(f"Response confidence: {avg_similarity*100:.1f}% average similarity")
+        logger.info(f"Sources used ({len(context_data['sources'])} total):")
+        for i, source in enumerate(context_data['sources'], 1):
+            logger.info(f"  {i}. {source['title']} ({source['course_code']}) - {source['similarity_score']*100:.0f}% match")
+
+        # User-facing source section (clean, no percentages or confidence levels)
+        sources_section = "\n\n**📚 Sources from your course materials:**"
 
         for i, source in enumerate(context_data['sources'][:3], 1):  # Show top 3 sources
-            confidence_text = f"({source['similarity_score']*100:.0f}% match)"
-            sources_section += f"{i}. {source['title']} ({source['course_code']}) {confidence_text}\n"
+            sources_section += f"\n{i}. {source['title']} ({source['course_code']})"
 
         if len(context_data['sources']) > 3:
-            sources_section += f"...and {len(context_data['sources']) - 3} more sources\n"
+            sources_section += f"\n*...and {len(context_data['sources']) - 3} more sources*"
 
-        # Add quality indicator - simplified
-        avg_similarity = context_data.get('average_similarity', 0)
-        if avg_similarity >= 0.8:
-            quality_note = "High confidence - Answer based on highly relevant course materials"
-        elif avg_similarity >= 0.6:
-            quality_note = "Medium confidence - Answer based on moderately relevant course materials"
-        else:
-            quality_note = "Lower confidence - Answer based on partially relevant course materials"
-
-        # Combine response with source attribution - clean format
-        enhanced_response = f"{response}\n{sources_section}\n{quality_note}"
+        # Combine response with clean source attribution
+        enhanced_response = f"{response}{sources_section}"
 
         return enhanced_response
 

@@ -87,6 +87,11 @@ def setup_logging():
                 'handlers': ['file'],
                 'level': 'WARNING',
                 'propagate': False
+            },
+            'apscheduler': {
+                'handlers': ['file'],
+                'level': 'WARNING',  # Suppress noisy INFO logs from scheduler
+                'propagate': False
             }
         }
     }

@@ -142,7 +142,7 @@ class LLMService:
                 payload = {
                     "inputs": prompt,
                     "parameters": {
-                        "max_new_tokens": 150,
+                        "max_new_tokens": 512,  # Increased for comprehensive responses
                         "temperature": 0.7,
                         "do_sample": True,
                         "top_p": 0.9,
@@ -154,7 +154,7 @@ class LLMService:
                 payload = {
                     "inputs": prompt,
                     "parameters": {
-                        "max_length": 256,
+                        "max_length": 768,  # Increased for comprehensive responses
                         "temperature": 0.7,
                         "do_sample": True,
                         "top_p": 0.9
@@ -222,7 +222,7 @@ class LLMService:
                 response = self.inference_client.chat_completion(
                     messages=messages,
                     model=model,
-                    max_tokens=150,
+                    max_tokens=512,  # Increased for comprehensive responses
                     temperature=0.7
                 )
 
@@ -314,19 +314,22 @@ RESPONSE:"""
         # Remove excessive whitespace
         response = " ".join(response.split())
         
-        # Limit response length
-        if len(response) > 500:
+        # Limit response length (configurable)
+        from config.settings import settings
+        max_length = settings.MAX_RESPONSE_LENGTH
+
+        if len(response) > max_length:
             # Try to end at a complete sentence
             sentences = response.split('. ')
             truncated = []
             char_count = 0
-            
+
             for sentence in sentences:
-                if char_count + len(sentence) > 450:
+                if char_count + len(sentence) > (max_length - 50):  # Leave margin for last sentence
                     break
                 truncated.append(sentence)
                 char_count += len(sentence) + 2
-            
+
             response = '. '.join(truncated)
             if not response.endswith('.'):
                 response += '.'
