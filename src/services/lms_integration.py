@@ -230,9 +230,13 @@ class MoodleConnector(BaseLMSConnector):
 class GoogleClassroomConnector(BaseLMSConnector):
     """Google Classroom connector using Google Classroom API"""
     
-    SCOPES = ['https://www.googleapis.com/auth/classroom.courses.readonly',
-              'https://www.googleapis.com/auth/classroom.student-submissions.students.readonly',
-              'https://www.googleapis.com/auth/drive.readonly']
+    SCOPES = [
+        'https://www.googleapis.com/auth/classroom.courses.readonly',
+        'https://www.googleapis.com/auth/classroom.coursework.students.readonly',
+        'https://www.googleapis.com/auth/classroom.coursework.me.readonly',
+        'https://www.googleapis.com/auth/classroom.student-submissions.students.readonly',
+        'https://www.googleapis.com/auth/drive.readonly'
+    ]
     
     def __init__(self, credentials_path: str):
         super().__init__()
@@ -514,22 +518,212 @@ class LMSIntegrationService:
     def sync_all_materials(self) -> Dict[str, int]:
         """Sync materials for all courses"""
         stats = {"courses_synced": 0, "documents_synced": 0}
-        
-        # First sync courses
+
+        # First sync courses from server-wide connectors
         courses = self.sync_courses()
         stats["courses_synced"] = len(courses)
-        
+
         # Then sync materials for each course
         for course in courses:
             documents = self.sync_course_materials(course)
             stats["documents_synced"] += len(documents)
-            
+
             # Add small delay to avoid overwhelming the API
             time.sleep(1)
-        
+
+        # Additionally sync per-user Google Classroom if enabled
+        if getattr(settings, 'PER_USER_GOOGLE_OAUTH', True):
+            per_user_stats = self.sync_per_user_google_classroom()
+            stats["courses_synced"] += per_user_stats["courses_synced"]
+            stats["documents_synced"] += per_user_stats["documents_synced"]
+
         logger.info(f"Sync completed - {stats}")
         return stats
-    
+
+    def sync_per_user_google_classroom(self) -> Dict[str, int]:
+        """Sync Google Classroom for each connected user"""
+        stats = {"courses_synced": 0, "documents_synced": 0}
+
+        try:
+            from src.data.models import User, CourseEnrollment
+
+            with db_manager.get_session() as session:
+                # Get all users with Google Classroom connected
+                connected_users = session.query(User).filter(
+                    User.google_classroom_connected == True
+                ).all()
+
+                logger.info(f"Found {len(connected_users)} users with Google Classroom connected")
+
+                for user in connected_users:
+                    try:
+                        # Create connector for this user
+                        connector = UserGoogleClassroomConnector(user.id, shared_oauth_manager)
+
+                        if not connector.authenticate():
+                            logger.warning(f"Failed to authenticate user {user.id}")
+                            continue
+
+                        # Get user's courses
+                        google_courses = connector.get_user_courses()
+
+                        for course_data in google_courses:
+                            # Check if course already exists
+                            existing_course = session.query(Course).filter(
+                                Course.lms_course_id == course_data['id'],
+                                Course.lms_platform == 'google_classroom'
+                            ).first()
+
+                            course = None
+                            if existing_course:
+                                # Update existing course
+                                existing_course.course_name = course_data['name']
+                                existing_course.updated_at = datetime.now()
+                                course = existing_course
+                            else:
+                                # Create new course
+                                course = Course(
+                                    course_code=course_data.get('section', course_data['name'][:20]),
+                                    course_name=course_data['name'],
+                                    description=course_data.get('descriptionHeading', ''),
+                                    lms_course_id=course_data['id'],
+                                    lms_platform='google_classroom',
+                                    year=datetime.now().year,
+                                    semester=self._determine_semester(),
+                                    is_active=True
+                                )
+                                session.add(course)
+                                session.flush()
+                                stats["courses_synced"] += 1
+
+                            # Ensure user is enrolled in this course
+                            enrollment = session.query(CourseEnrollment).filter(
+                                CourseEnrollment.user_id == user.id,
+                                CourseEnrollment.course_id == course.id
+                            ).first()
+
+                            if not enrollment:
+                                enrollment = CourseEnrollment(
+                                    user_id=user.id,
+                                    course_id=course.id,
+                                    enrollment_date=datetime.now(),
+                                    is_active=True
+                                )
+                                session.add(enrollment)
+
+                            # Sync course materials
+                            documents = self._sync_google_classroom_materials(
+                                connector, course, session
+                            )
+                            stats["documents_synced"] += len(documents)
+
+                        session.commit()
+                        logger.info(f"Synced {len(google_courses)} courses for user {user.id}")
+
+                        # Small delay between users
+                        time.sleep(1)
+
+                    except Exception as e:
+                        logger.error(f"Error syncing Google Classroom for user {user.id}: {e}")
+                        session.rollback()
+                        continue
+
+                logger.info(f"Per-user Google Classroom sync completed: {stats}")
+
+        except Exception as e:
+            logger.error(f"Error in per-user Google Classroom sync: {e}")
+
+        return stats
+
+    def _sync_google_classroom_materials(self, connector: UserGoogleClassroomConnector,
+                                       course: Course, session) -> List[Document]:
+        """Sync materials for a Google Classroom course"""
+        synced_documents = []
+
+        try:
+            # Get course work and materials
+            coursework = connector.service.courses().courseWork().list(
+                courseId=course.lms_course_id
+            ).execute()
+
+            for work in coursework.get('courseWork', []):
+                # Process attachments
+                for material in work.get('materials', []):
+                    if 'driveFile' in material:
+                        drive_file = material['driveFile']['driveFile']
+
+                        # Check if it's a supported file type
+                        filename = drive_file['title']
+                        file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
+
+                        if file_ext in settings.SUPPORTED_FILE_TYPES:
+                            # Check if document already exists
+                            existing_doc = session.query(Document).filter(
+                                Document.lms_document_id == drive_file['id'],
+                                Document.course_id == course.id
+                            ).first()
+
+                            if not existing_doc:
+                                # Download new document
+                                try:
+                                    local_path = self._download_google_drive_file(
+                                        connector, drive_file, course, filename
+                                    )
+
+                                    if local_path:
+                                        new_document = Document(
+                                            course_id=course.id,
+                                            title=filename,
+                                            file_path=local_path,
+                                            file_type=file_ext,
+                                            file_size=0,  # Size would need separate API call
+                                            lms_document_id=drive_file['id'],
+                                            lms_last_modified=datetime.now(),
+                                            is_processed=False,
+                                            processing_status="pending"
+                                        )
+                                        session.add(new_document)
+                                        session.flush()
+                                        synced_documents.append(new_document)
+                                        logger.info(f"Added new document: {filename}")
+
+                                except Exception as e:
+                                    logger.error(f"Failed to download document {filename}: {e}")
+                                    continue
+
+        except Exception as e:
+            logger.error(f"Error syncing materials for course {course.course_name}: {e}")
+
+        return synced_documents
+
+    def _download_google_drive_file(self, connector: UserGoogleClassroomConnector,
+                                   drive_file: Dict, course: Course, filename: str) -> Optional[str]:
+        """Download a file from Google Drive"""
+        try:
+            file_id = drive_file['id']
+
+            # Create local directory
+            local_dir = Path("./data/documents")
+            local_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create safe filename
+            safe_filename = "".join(c for c in filename if c.isalnum() or c in (' ', '.', '_')).rstrip()
+            local_path = local_dir / f"{course.lms_course_id}_{safe_filename}"
+
+            # Download file using the Drive service
+            request = connector.drive_service.files().get_media(fileId=file_id)
+            content = request.execute()
+
+            with open(local_path, 'wb') as f:
+                f.write(content)
+
+            logger.info(f"Downloaded Google Drive file: {local_path}")
+            return str(local_path)
+
+        except Exception as e:
+            logger.error(f"Error downloading Google Drive file {filename}: {e}")
+            return None
+
     def _determine_semester(self) -> str:
         """Determine current semester based on date"""
         month = datetime.now().month

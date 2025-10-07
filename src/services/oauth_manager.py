@@ -25,7 +25,7 @@ class UserOAuthManager:
     
     SCOPES = [
         'https://www.googleapis.com/auth/classroom.courses.readonly',
-        'https://www.googleapis.com/auth/classroom.student-submissions.students.readonly',
+        'https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly',
         'https://www.googleapis.com/auth/classroom.rosters.readonly',
         'https://www.googleapis.com/auth/drive.readonly'
     ]
@@ -97,9 +97,43 @@ class UserOAuthManager:
             
             # Exchange authorization code for credentials
             logger.info("Exchanging authorization code for credentials...")
-            flow.fetch_token(code=authorization_code)
-            credentials = flow.credentials
-            logger.info("Successfully obtained credentials")
+
+            # Manually perform token exchange to handle scope mismatches gracefully
+            import requests
+
+            token_url = flow.client_config['token_uri']
+            token_data = {
+                'code': authorization_code,
+                'client_id': flow.client_config['client_id'],
+                'client_secret': flow.client_config['client_secret'],
+                'redirect_uri': flow.redirect_uri,
+                'grant_type': 'authorization_code'
+            }
+
+            try:
+                # Make direct request to token endpoint
+                response = requests.post(token_url, data=token_data)
+                response.raise_for_status()
+                token_response = response.json()
+
+                if 'access_token' in token_response:
+                    # Successfully got token, create credentials
+                    credentials = Credentials(
+                        token=token_response['access_token'],
+                        refresh_token=token_response.get('refresh_token'),
+                        token_uri=token_url,
+                        client_id=flow.client_config['client_id'],
+                        client_secret=flow.client_config['client_secret'],
+                        scopes=token_response.get('scope', '').split()
+                    )
+                    logger.info("Successfully obtained credentials via direct token exchange")
+                else:
+                    logger.error(f"No access token in response: {token_response}")
+                    raise ValueError("Failed to get access token from Google")
+
+            except requests.RequestException as e:
+                logger.error(f"Failed to exchange authorization code: {e}")
+                raise ValueError(f"Token exchange failed: {e}")
             
             # Store credentials for user
             logger.info(f"Storing credentials for user {user_id}")

@@ -239,23 +239,40 @@ class LLMService:
         return None
     
     def generate_response(self, query: str, context: str = "", user_preferences: Dict[str, Any] = None) -> str:
-        """Generate response using available LLM"""
+        """Generate response using available LLM with enhanced context integration"""
         try:
-            # Prepare prompt with context
+            # Prepare enhanced prompt with context
             if context.strip():
-                prompt = f"""Based on the following course materials, answer the student's question clearly and concisely:
+                # Use more context and make it more directive
+                prompt = f"""You are an AI study assistant. IMPORTANT: Base your answer EXCLUSIVELY on the provided course materials below. Do NOT use external knowledge.
 
-Course Materials: {context[:1500]}...
+COURSE MATERIALS:
+{context[:5000]}
 
-Student Question: {query}
+STUDENT QUESTION: {query}
 
-Answer:"""
+INSTRUCTIONS:
+1. Answer based ONLY on the course materials provided above
+2. Quote specific parts of the course materials when relevant
+3. Provide comprehensive, detailed explanations using the course content
+4. Reference the source material directly in your answer
+5. Give step-by-step explanations when the materials contain procedures
+6. Include examples from the course materials when available
+7. Be thorough and educational in your response
+
+ANSWER:"""
             else:
-                prompt = f"""You are an AI study assistant. Answer this student's question helpfully:
+                # Enhanced general prompt
+                prompt = f"""You are an AI study assistant helping a student. Since no specific course materials are provided, give a helpful general academic response.
 
-Question: {query}
+STUDENT QUESTION: {query}
 
-Answer:"""
+INSTRUCTIONS:
+1. Provide a clear, educational response
+2. Suggest where the student might find more specific information (course materials, textbooks, etc.)
+3. Acknowledge that you're providing general guidance without access to their specific course content
+
+ANSWER:"""
             
             # Try chat completion API first
             try:
@@ -320,18 +337,24 @@ Answer:"""
         return response
     
     def _generate_fallback_response(self, query: str, context: str) -> str:
-        """Generate fallback response when LLM is unavailable"""
+        """Enhanced fallback response when LLM is unavailable"""
         query_lower = query.lower()
-        
+
         if context.strip():
-            # We have context from RAG, provide a structured response
-            return f"""Based on your course materials, here's what I found related to "{query}":
+            # We have context from RAG, provide a comprehensive structured response
+            return f"""**Based on your course materials:**
 
-{context[:300]}...
+{context[:800]}
 
-This information should help answer your question. If you need more specific details, try asking about particular concepts mentioned in your materials.
+**Direct Answer to "{query}":**
+The course materials above contain relevant information that should help answer your question. Key points to focus on are the concepts and definitions mentioned in the material.
 
-*Note: Enhanced AI responses temporarily unavailable. Using basic text analysis.*"""
+**For more specific guidance:**
+- Review the complete sections these excerpts come from
+- Look for related examples or practice problems
+- Use /sync to ensure you have the latest course materials
+
+*Note: Enhanced AI responses temporarily unavailable. This response is based directly on your uploaded course content.*"""
         
         # No context available, provide general guidance
         if any(word in query_lower for word in ['what is', 'define', 'explain']):

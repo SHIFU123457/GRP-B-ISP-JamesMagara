@@ -660,15 +660,16 @@ Choose a setting to modify:
                 response_text = await self._process_query_rag_enhanced(query_text, user)
                 
                 # Send response (split if too long for Telegram)
+                # Temporarily disable Markdown to fix parsing errors
                 if len(response_text) > 4096:  # Telegram message limit
                     # Split at natural break points
                     parts = self._split_long_message(response_text)
                     for i, part in enumerate(parts):
-                        await update.message.reply_text(part, parse_mode='Markdown')
+                        await update.message.reply_text(part)  # No parse_mode
                         if i < len(parts) - 1:  # Small delay between parts
                             await asyncio.sleep(0.5)
                 else:
-                    await update.message.reply_text(response_text, parse_mode='Markdown')
+                    await update.message.reply_text(response_text)  # No parse_mode
                 
                 # Create feedback buttons
                 keyboard = [

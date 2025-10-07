@@ -78,10 +78,10 @@ class RAGPipeline:
                 )
             )
             
-            # Get or create collection
+            # Get or create collection with cosine similarity
             self.collection = self.vector_store.get_or_create_collection(
                 name="study_documents",
-                metadata={"description": "Academic documents for Study Helper Agent"}
+                metadata={"description": "Academic documents for Study Helper Agent", "hnsw:space": "cosine"}
             )
             
             # Initialize LLM service
@@ -183,94 +183,182 @@ class RAGPipeline:
             return False
     
     @retry_with_backoff(max_retries=2, base_delay=0.5)
-    def retrieve_relevant_chunks(self, query: str, course_id: Optional[int] = None, top_k: int = 5) -> List[Dict[str, Any]]:
+    def retrieve_relevant_chunks(self, query: str, course_id: Optional[int] = None, top_k: int = None) -> List[Dict[str, Any]]:
         """Retrieve most relevant chunks for a given query"""
         try:
+            # Use configured top_k if not specified
+            if top_k is None:
+                top_k = settings.TOP_K_RETRIEVAL
+
             # Generate query embedding
+            logger.info(f"Using embedding model: {self.embedding_model_name}")
             query_embedding = self.embedding_model.encode(query).tolist()
-            
+            logger.info(f"Query embedding shape: {len(query_embedding)}")
+            logger.info(f"Query embedding sample: {query_embedding[:5]}")  # First 5 values
+
             # Prepare filter for course-specific search
             where_filter = {}
             if course_id:
                 where_filter["course_id"] = course_id
-            
-            # Search in ChromaDB
-            results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=top_k,
-                where=where_filter if where_filter else None,
-                include=['documents', 'metadatas', 'distances']
-            )
-            
-            # Format results
+
+            # Search in ChromaDB - temporarily remove where filter to debug
+            try:
+                results = self.collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=top_k,
+                    # where=where_filter if where_filter else None,  # Temporarily disabled
+                    include=['documents', 'metadatas', 'distances']
+                )
+                logger.info(f"ChromaDB query successful - where filter disabled for debugging")
+            except Exception as query_error:
+                logger.error(f"ChromaDB query failed: {query_error}")
+                return []
+
+            # Format results with debug logging
             relevant_chunks = []
+            all_chunks_count = 0
+
             if results['documents'] and results['documents'][0]:
+                all_chunks_count = len(results['documents'][0])
+                logger.info(f"Found {all_chunks_count} total chunks from vector search")
+
                 for i, (doc, metadata, distance) in enumerate(zip(
                     results['documents'][0],
-                    results['metadatas'][0], 
+                    results['metadatas'][0],
                     results['distances'][0]
                 )):
-                    similarity_score = 1 - distance
-                    if similarity_score >= settings.SIMILARITY_THRESHOLD:
+                    # Handle both cosine and euclidean distance metrics
+                    if distance > 1.0:
+                        # Euclidean distance - convert to similarity differently
+                        # For euclidean, smaller distance = higher similarity
+                        # Normalize to 0-1 range where 1 is most similar
+                        max_distance = 2.0  # Approximate max for sentence embeddings
+                        similarity_score = max(0, (max_distance - distance) / max_distance)
+                        logger.info(f"    Euclidean distance {distance:.3f} -> similarity {similarity_score:.3f}")
+                    else:
+                        # Cosine distance - standard conversion
+                        similarity_score = 1 - distance
+
+                    # Add debug logging
+                    logger.info(f"Chunk {i+1}: similarity={similarity_score:.3f}, threshold={settings.SIMILARITY_THRESHOLD}")
+
+                    # Use a reasonable threshold now that we fixed distance calculation
+                    if similarity_score >= 0.1:  # Accept chunks with 10%+ similarity
                         relevant_chunks.append({
                             'text': doc,
                             'metadata': metadata,
                             'similarity_score': similarity_score,
                             'rank': i + 1
                         })
-            
-            logger.info(f"Retrieved {len(relevant_chunks)} relevant chunks for query: {query[:50]}...")
+            else:
+                logger.warning("No documents returned from ChromaDB query")
+
+            logger.info(f"Retrieved {len(relevant_chunks)} relevant chunks (from {all_chunks_count} total) for query: {query[:50]}...")
+
+            # Log similarity scores for all chunks found
+            if all_chunks_count > 0:
+                logger.info("All chunk similarity scores and content preview:")
+                for i, (distance, doc, metadata) in enumerate(zip(results['distances'][0], results['documents'][0], results['metadatas'][0])):
+                    # Apply same distance conversion as above
+                    if distance > 1.0:
+                        max_distance = 2.0
+                        similarity = max(0, (max_distance - distance) / max_distance)
+                    else:
+                        similarity = 1 - distance
+                    logger.info(f"  Chunk {i+1}: similarity={similarity:.3f}")
+                    logger.info(f"    Content: {doc[:100]}...")
+                    logger.info(f"    Metadata: {metadata}")
+                    logger.info(f"    Distance: {distance}")
+                    logger.info(f"    Query: {query[:50]}...")
+
+            # If no chunks found with relaxed threshold, there's a deeper issue
+            if len(relevant_chunks) == 0:
+                logger.error(f"No chunks found even with relaxed threshold. Vector store may be empty or query embedding failed.")
+
+                # Check collection stats
+                try:
+                    collection_count = self.collection.count()
+                    logger.error(f"Collection has {collection_count} total embeddings")
+                except Exception as count_error:
+                    logger.error(f"Failed to get collection count: {count_error}")
+            else:
+                logger.info(f"Successfully retrieved {len(relevant_chunks)} chunks with similarities: {[f'{c['similarity_score']:.3f}' for c in relevant_chunks]}")
+
             return relevant_chunks
-            
+
         except Exception as e:
             logger.error(f"Error retrieving relevant chunks: {e}")
             return []
     
-    def generate_context(self, query: str, course_id: Optional[int] = None, max_context_length: int = 2000) -> Dict[str, Any]:
-        """Generate context for RAG-enhanced response"""
+    def generate_context(self, query: str, course_id: Optional[int] = None, max_context_length: Optional[int] = None) -> Dict[str, Any]:
+        """Generate enhanced context for RAG-enhanced response with better source integration"""
         try:
-            # Retrieve relevant chunks
-            relevant_chunks = self.retrieve_relevant_chunks(query, course_id)
-            
+            # Use configurable context length
+            if max_context_length is None:
+                max_context_length = settings.CONTEXT_MAX_LENGTH
+
+            # Retrieve relevant chunks with higher similarity threshold for better quality
+            relevant_chunks = self.retrieve_relevant_chunks(query, course_id, top_k=settings.TOP_K_RETRIEVAL)
+
             if not relevant_chunks:
                 return {
                     'context': '',
                     'sources': [],
                     'has_relevant_content': False
                 }
-            
-            # Build context string
+
+            # Filter chunks by minimum similarity score for higher quality
+            # Use extremely low threshold for debugging
+            high_quality_chunks = [chunk for chunk in relevant_chunks if chunk['similarity_score'] >= 0.01]
+
+            if not high_quality_chunks:
+                # If no high-quality chunks, use ALL chunks we retrieved
+                high_quality_chunks = relevant_chunks
+                logger.warning("No chunks passed quality filter, using all retrieved chunks")
+
+            logger.info(f"Filtered to {len(high_quality_chunks)} high-quality chunks from {len(relevant_chunks)} total")
+
+            # Build enhanced context string with clear source attribution
             context_parts = []
             sources = []
             current_length = 0
-            
-            for chunk in relevant_chunks:
+
+            for chunk in high_quality_chunks:
                 chunk_text = chunk['text']
-                
+                chunk_title = chunk['metadata'].get('title', 'Unknown Document')
+                course_code = chunk['metadata'].get('course_code', 'Unknown')
+                similarity_score = chunk['similarity_score']
+
                 # Check if adding this chunk would exceed limit
                 if current_length + len(chunk_text) > max_context_length:
                     break
-                
-                context_parts.append(f"[Source: {chunk['metadata'].get('title', 'Unknown')}]\n{chunk_text}")
+
+                # Format with simple, clean attribution
+                formatted_chunk = f"[Source: {chunk_title} ({course_code})]\n{chunk_text}"
+
+                context_parts.append(formatted_chunk)
                 sources.append({
-                    'title': chunk['metadata'].get('title', 'Unknown'),
-                    'course_code': chunk['metadata'].get('course_code', 'Unknown'),
-                    'similarity_score': chunk['similarity_score'],
-                    'chunk_index': chunk['metadata'].get('chunk_index', 0)
+                    'title': chunk_title,
+                    'course_code': course_code,
+                    'similarity_score': similarity_score,
+                    'chunk_index': chunk['metadata'].get('chunk_index', 0),
+                    'confidence_level': 'high' if similarity_score >= 0.8 else 'medium' if similarity_score >= 0.6 else 'low'
                 })
-                
-                current_length += len(chunk_text)
-            
+
+                current_length += len(chunk_text) + 100  # Account for formatting
+
+            # Create simple context without complex formatting
             context = "\n\n".join(context_parts)
-            
+
             return {
                 'context': context,
                 'sources': sources,
                 'has_relevant_content': True,
                 'total_chunks': len(relevant_chunks),
-                'used_chunks': len(context_parts)
+                'used_chunks': len(context_parts),
+                'average_similarity': sum(s['similarity_score'] for s in sources) / len(sources) if sources else 0
             }
-            
+
         except Exception as e:
             logger.error(f"Error generating context: {e}")
             return {
@@ -279,38 +367,179 @@ class RAGPipeline:
                 'has_relevant_content': False
             }
    
+    def _is_casual_conversation(self, query: str) -> bool:
+        """Determine if query is casual conversation vs academic question"""
+        query_lower = query.lower().strip()
+
+        # Greetings and casual conversation patterns
+        casual_patterns = [
+            # Greetings
+            'hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening',
+            'how are you', 'how\'s your day', 'how is your day', 'whats up', 'what\'s up',
+
+            # Personal questions about the bot
+            'tell me about yourself', 'who are you', 'what are you', 'introduce yourself',
+            'what do you do', 'what can you do',
+
+            # Casual chat
+            'how\'s it going', 'how is it going', 'nice to meet you', 'pleasure to meet you',
+            'thanks', 'thank you', 'goodbye', 'bye', 'see you later', 'talk to you later',
+
+            # Weather/general small talk
+            'how\'s the weather', 'nice day', 'beautiful day',
+
+            # Single word greetings
+            'morning', 'afternoon', 'evening'
+        ]
+
+        # Check if query starts with or contains casual patterns
+        for pattern in casual_patterns:
+            if query_lower.startswith(pattern) or query_lower == pattern:
+                return True
+            # For very short queries that are just greetings
+            if len(query_lower.split()) <= 3 and pattern in query_lower:
+                return True
+
+        # Check for question marks with casual content
+        if '?' in query_lower:
+            casual_question_patterns = [
+                'how are you', 'who are you', 'what are you', 'how\'s your day',
+                'what do you do', 'tell me about yourself'
+            ]
+            for pattern in casual_question_patterns:
+                if pattern in query_lower:
+                    return True
+
+        return False
+
+    def _generate_casual_response(self, query: str, user_preferences: Dict[str, Any] = None) -> str:
+        """Generate appropriate casual conversation responses"""
+        query_lower = query.lower().strip()
+
+        # Greetings
+        if any(greeting in query_lower for greeting in ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening']):
+            return "Hello! I'm your Study Helper Agent. I'm here to help you with questions about your course materials, assignments, and academic content. How can I assist you with your studies today?"
+
+        # How are you / How's your day
+        if any(phrase in query_lower for phrase in ['how are you', 'how\'s your day', 'how is your day', 'how\'s it going']):
+            return "I'm doing great, thank you for asking! I'm ready to help you with your studies. I can answer questions about your course materials, explain concepts, help with assignments, or provide information from your uploaded documents. What would you like to learn about today?"
+
+        # About yourself / Who are you
+        if any(phrase in query_lower for phrase in ['tell me about yourself', 'who are you', 'what are you', 'introduce yourself']):
+            return """I'm your AI Study Helper Agent! Here's what I can do for you:
+
+ACADEMIC SUPPORT:
+- Answer questions about your course materials
+- Explain concepts from your textbooks and lecture notes
+- Help with assignments and homework
+- Provide summaries of your documents
+
+SMART SEARCH:
+- Find relevant information from your uploaded materials
+- Reference specific documents and sources
+- Connect concepts across different courses
+
+PERSONALIZED LEARNING:
+- Adapt to your learning style and preferences
+- Provide explanations at your preferred difficulty level
+- Track your learning progress
+
+Just ask me anything about your studies, and I'll search through your course materials to give you the most relevant, helpful answers!"""
+
+        # What can you do
+        if any(phrase in query_lower for phrase in ['what do you do', 'what can you do']):
+            return """I can help you with your academic studies in several ways:
+
+ANSWER QUESTIONS: Ask me about any topic from your course materials
+SEARCH DOCUMENTS: I'll find relevant information from your uploaded files
+EXPLAIN CONCEPTS: Get clear explanations tailored to your learning style
+ASSIGNMENT HELP: Guidance based on your actual course content
+STUDY SUPPORT: Summaries, examples, and step-by-step explanations
+
+Try asking me something like:
+- "Explain database normalization from my course materials"
+- "What does my textbook say about data structures?"
+- "Help me understand the assignment requirements"
+
+What would you like to learn about?"""
+
+        # Thanks
+        if any(phrase in query_lower for phrase in ['thanks', 'thank you']):
+            return "You're very welcome! I'm always here to help with your studies. Feel free to ask me any questions about your course materials anytime!"
+
+        # Goodbye
+        if any(phrase in query_lower for phrase in ['goodbye', 'bye', 'see you later', 'talk to you later']):
+            return "Goodbye! Good luck with your studies. I'll be here whenever you need help with your course materials. Have a great day!"
+
+        # Default casual response
+        return "I'm your Study Helper Agent, ready to assist you with your academic questions! I can help you understand concepts from your course materials, find information in your documents, and support your learning. What would you like to study today?"
+
     def generate_rag_response(self, query: str, course_id: Optional[int] = None, user_preferences: Dict[str, Any] = None) -> Dict[str, Any]:
         """Generate complete RAG response using LLM with retrieved context"""
         try:
-            # Generate context from relevant documents
-            context_data = self.generate_context(query, course_id)
-            
-            if not context_data['has_relevant_content']:
-                # No relevant content found, let LLM handle it
-                response = self.llm_service.generate_response(query, "", user_preferences)
+            # Check if this is casual conversation that shouldn't use course materials
+            if self._is_casual_conversation(query):
+                logger.info(f"Detected casual conversation query: '{query[:50]}...' - responding without course materials")
+
+                # Generate a friendly, personal response without course context
+                casual_response = self._generate_casual_response(query, user_preferences)
+
                 return {
-                    'response': response,
+                    'response': casual_response,
                     'context_used': False,
                     'sources': [],
-                    'confidence': 'low'
+                    'confidence': 'high',
+                    'reason': 'casual_conversation'
                 }
-            
+
+            # Generate context from relevant documents for academic questions
+            context_data = self.generate_context(query, course_id)
+
+            if not context_data['has_relevant_content']:
+                # No relevant content found - provide simple guidance
+                no_context_response = f"""I couldn't find specific information about "{query}" in your uploaded course materials.
+
+This might be because:
+- The topic hasn't been covered in uploaded materials yet
+- Different terminology is used in your course materials
+- The materials need to be processed (use /process_docs)
+- Your course materials need to be synced (use /sync)
+
+Suggestions:
+- Try rephrasing your question with terms from your textbook
+- Ask about topics from your enrolled courses
+- Check if your instructor has uploaded relevant materials
+
+I can provide general academic guidance, but for course-specific information, please ensure your materials are up to date."""
+
+                return {
+                    'response': no_context_response,
+                    'context_used': False,
+                    'sources': [],
+                    'confidence': 'low',
+                    'reason': 'no_relevant_context'
+                }
+
             # Generate response using LLM with context
             response = self.llm_service.generate_response(
-                query, 
-                context_data['context'], 
+                query,
+                context_data['context'],
                 user_preferences
             )
-            
+
+            # Enhance response with source information
+            enhanced_response = self._enhance_response_with_sources(response, context_data)
+
             return {
-                'response': response,
+                'response': enhanced_response,
                 'context_used': True,
                 'sources': context_data['sources'],
                 'chunks_retrieved': context_data['total_chunks'],
                 'chunks_used': context_data['used_chunks'],
-                'confidence': self._assess_response_confidence(context_data['sources'])
+                'confidence': self._assess_response_confidence(context_data['sources']),
+                'average_similarity': context_data.get('average_similarity', 0)
             }
-            
+
         except Exception as e:
             logger.error(f"Error generating RAG response: {e}")
             # Fallback to basic LLM response
@@ -323,13 +552,42 @@ class RAGPipeline:
                 'error': str(e)
             }
     
+    def _enhance_response_with_sources(self, response: str, context_data: Dict[str, Any]) -> str:
+        """Enhance LLM response with source attribution and context verification"""
+        if not context_data.get('sources'):
+            return response
+
+        # Add source references to the response - simplified format to avoid Telegram parsing issues
+        sources_section = "\n\nCourse Material Sources:\n"
+
+        for i, source in enumerate(context_data['sources'][:3], 1):  # Show top 3 sources
+            confidence_text = f"({source['similarity_score']*100:.0f}% match)"
+            sources_section += f"{i}. {source['title']} ({source['course_code']}) {confidence_text}\n"
+
+        if len(context_data['sources']) > 3:
+            sources_section += f"...and {len(context_data['sources']) - 3} more sources\n"
+
+        # Add quality indicator - simplified
+        avg_similarity = context_data.get('average_similarity', 0)
+        if avg_similarity >= 0.8:
+            quality_note = "High confidence - Answer based on highly relevant course materials"
+        elif avg_similarity >= 0.6:
+            quality_note = "Medium confidence - Answer based on moderately relevant course materials"
+        else:
+            quality_note = "Lower confidence - Answer based on partially relevant course materials"
+
+        # Combine response with source attribution - clean format
+        enhanced_response = f"{response}\n{sources_section}\n{quality_note}"
+
+        return enhanced_response
+
     def _assess_response_confidence(self, sources: List[Dict[str, Any]]) -> str:
         """Assess confidence level based on source quality"""
         if not sources:
             return 'low'
-        
+
         avg_similarity = sum(source['similarity_score'] for source in sources) / len(sources)
-        
+
         if avg_similarity >= 0.8:
             return 'high'
         elif avg_similarity >= 0.6:
