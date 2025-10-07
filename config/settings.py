@@ -46,7 +46,7 @@ class Settings:
     HIGH_QUALITY_THRESHOLD: float = float(os.getenv("HIGH_QUALITY_THRESHOLD", "0.3"))  # threshold for quality filtering
 
     # Document Processing Settings
-    SUPPORTED_FILE_TYPES: list = ["pdf", "docx", "txt", "doc"]
+    SUPPORTED_FILE_TYPES: list = ["pdf", "docx", "txt", "doc", "pptx", "ppt"]
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
 
     # Scheduler Settings

@@ -262,17 +262,14 @@ INSTRUCTIONS:
 
 ANSWER:"""
             else:
-                # Enhanced general prompt
-                prompt = f"""You are an AI study assistant helping a student. Since no specific course materials are provided, give a helpful general academic response.
+                # Natural conversation prompt for non-educational queries
+                prompt = f"""You are a helpful AI study assistant. Respond naturally and conversationally to the user's message.
 
-STUDENT QUESTION: {query}
+USER MESSAGE: {query}
 
-INSTRUCTIONS:
-1. Provide a clear, educational response
-2. Suggest where the student might find more specific information (course materials, textbooks, etc.)
-3. Acknowledge that you're providing general guidance without access to their specific course content
+Respond in a friendly, helpful manner. If the message is a greeting, greet them back. If they're asking about you, introduce yourself as an AI study assistant. Be natural and conversational.
 
-ANSWER:"""
+RESPONSE:"""
             
             # Try chat completion API first
             try:

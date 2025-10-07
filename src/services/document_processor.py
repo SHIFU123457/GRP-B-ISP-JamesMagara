@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 import PyPDF2
 import fitz  # PyMuPDF for better PDF extraction
 from docx import Document as DocxDocument
+from pptx import Presentation  # PowerPoint processing
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
@@ -53,12 +54,14 @@ class DocumentProcessor:
                 return self._extract_pdf_text(file_path)
             elif file_type.lower() in ['docx', 'doc']:
                 return self._extract_docx_text(file_path)
+            elif file_type.lower() in ['pptx', 'ppt']:
+                return self._extract_pptx_text(file_path)
             elif file_type.lower() == 'txt':
                 return self._extract_txt_text(file_path)
             else:
                 logger.warning(f"Unsupported file type: {file_type}")
                 return None
-                
+
         except Exception as e:
             logger.error(f"Error extracting text from {file_path}: {e}")
             return None
@@ -110,6 +113,46 @@ class DocumentProcessor:
         """Extract text from plain text files"""
         with open(file_path, 'r', encoding='utf-8') as file:
             return file.read().strip()
+
+    @safe_file_operation("PowerPoint text extraction")
+    def _extract_pptx_text(self, file_path: str) -> str:
+        """Extract text from PowerPoint files (.pptx, .ppt)"""
+        try:
+            presentation = Presentation(file_path)
+            text_content = []
+
+            for slide_num, slide in enumerate(presentation.slides, 1):
+                slide_text = []
+
+                # Extract text from all shapes in the slide
+                for shape in slide.shapes:
+                    if hasattr(shape, "text") and shape.text.strip():
+                        slide_text.append(shape.text.strip())
+
+                    # Handle tables in slides
+                    if shape.has_table:
+                        table = shape.table
+                        for row in table.rows:
+                            row_text = []
+                            for cell in row.cells:
+                                if cell.text.strip():
+                                    row_text.append(cell.text.strip())
+                            if row_text:
+                                slide_text.append(" | ".join(row_text))
+
+                # Add slide content with slide number
+                if slide_text:
+                    slide_content = f"\n--- Slide {slide_num} ---\n" + "\n".join(slide_text)
+                    text_content.append(slide_content)
+
+            extracted_text = "\n\n".join(text_content)
+            logger.info(f"Successfully extracted {len(extracted_text)} characters from PowerPoint with {len(presentation.slides)} slides")
+
+            return extracted_text.strip()
+
+        except Exception as e:
+            logger.error(f"Error extracting text from PowerPoint {file_path}: {e}")
+            return ""
     
     def clean_text(self, text: str) -> str:
         """Clean and preprocess text"""
