@@ -110,8 +110,8 @@ class StudyHelperBot:
             logger.error(f"❌ Error processing notifications: {e}")
 
     def _create_notification_keyboard(self, notification: dict) -> List[List[InlineKeyboardButton]]:
-        """Create interactive keyboard for notifications"""
-        material_type = notification.get('material_type', 'reading')
+        """Create type-specific interactive keyboard for notifications"""
+        material_type = notification.get('material_type', 'material')
         document_title = notification.get('document_title', '')
         course_name = notification.get('course_name', '')
         document_id = notification.get('document_id', '')
@@ -121,8 +121,8 @@ class StudyHelperBot:
         if material_type == 'assignment':
             keyboard = [
                 [
-                    InlineKeyboardButton("📝 Help with Assignment",
-                                       callback_data=f"help_assignment_{document_id}"),
+                    InlineKeyboardButton("✍️ Help Complete Assignment",
+                                       callback_data=f"complete_assignment_{document_id}"),
                     InlineKeyboardButton("📋 Break Down Tasks",
                                        callback_data=f"breakdown_assignment_{document_id}")
                 ],
@@ -134,27 +134,45 @@ class StudyHelperBot:
         elif material_type == 'quiz':
             keyboard = [
                 [
-                    InlineKeyboardButton("🧠 Help Me Study",
-                                       callback_data=f"study_quiz_{document_id}"),
-                    InlineKeyboardButton("❓ Practice Questions",
-                                       callback_data=f"practice_quiz_{document_id}")
+                    InlineKeyboardButton("✍️ Help Answer Quiz",
+                                       callback_data=f"complete_quiz_{document_id}"),
+                    InlineKeyboardButton("🧠 Study for Quiz",
+                                       callback_data=f"study_quiz_{document_id}")
                 ],
                 [
-                    InlineKeyboardButton("📝 Key Concepts",
-                                       callback_data=f"concepts_quiz_{document_id}")
+                    InlineKeyboardButton("❓ Practice Questions",
+                                       callback_data=f"practice_quiz_{document_id}")
                 ]
             ]
-        else:  # reading material
+        elif material_type == 'question':
+            keyboard = [
+                [
+                    InlineKeyboardButton("✍️ Help Answer Question",
+                                       callback_data=f"complete_question_{document_id}"),
+                    InlineKeyboardButton("💡 Hint",
+                                       callback_data=f"hint_question_{document_id}")
+                ]
+            ]
+        elif material_type == 'announcement':
+            keyboard = [
+                [
+                    InlineKeyboardButton("📖 Summarize",
+                                       callback_data=f"summarize_announcement_{document_id}"),
+                    InlineKeyboardButton("❓ Ask About This",
+                                       callback_data=f"ask_announcement_{document_id}")
+                ]
+            ]
+        else:  # material (reading/document)
             keyboard = [
                 [
                     InlineKeyboardButton("📖 Summarize Document",
-                                       callback_data=f"summarize_reading_{document_id}"),
+                                       callback_data=f"summarize_material_{document_id}"),
                     InlineKeyboardButton("❓ Ask Questions",
-                                       callback_data=f"questions_reading_{document_id}")
+                                       callback_data=f"questions_material_{document_id}")
                 ],
                 [
                     InlineKeyboardButton("🔍 Key Points",
-                                       callback_data=f"keypoints_reading_{document_id}")
+                                       callback_data=f"keypoints_material_{document_id}")
                 ]
             ]
 
@@ -931,9 +949,11 @@ Choose a setting to modify:
                 )
 
             # Handle material assistance callbacks
-            elif callback_data.startswith(("help_assignment_", "breakdown_assignment_", "explain_assignment_",
-                                          "study_quiz_", "practice_quiz_", "concepts_quiz_",
-                                          "summarize_reading_", "questions_reading_", "keypoints_reading_")):
+            elif callback_data.startswith(("complete_assignment_", "breakdown_assignment_", "explain_assignment_",
+                                          "complete_quiz_", "study_quiz_", "practice_quiz_",
+                                          "complete_question_", "hint_question_",
+                                          "summarize_announcement_", "ask_announcement_",
+                                          "summarize_material_", "questions_material_", "keypoints_material_")):
                 await self._handle_material_assistance(update, context, callback_data)
 
             else:
@@ -1002,26 +1022,64 @@ Choose a setting to modify:
             await query.edit_message_text("❌ Sorry, something went wrong while processing your request. Please try again.")
 
     async def _generate_material_response(self, action: str, doc_id: int, doc_title: str, user_id: int) -> str:
-        """Generate appropriate response based on the requested action"""
+        """Generate appropriate response based on the requested action with RAG-powered assistance"""
         try:
-            # Create context-aware queries based on the action
-            if action == "help_assignment":
-                query = f"Help me understand and complete the assignment '{doc_title}'. What are the main requirements and how should I approach it?"
+            # Get document metadata from database
+            with db_manager.get_session() as session:
+                from src.data.models import Document
+                document = session.query(Document).filter(Document.id == doc_id).first()
+
+                if not document:
+                    return "❌ Document not found"
+
+                # Cache document metadata
+                material_type = document.material_type
+                submission_required = document.submission_required
+                due_date = document.due_date
+                questions_data = document.questions
+
+            # Create context-aware queries based on the action type
+            if action == "complete_assignment":
+                query = f"Help me complete the assignment '{doc_title}'. Provide step-by-step guidance based on the requirements and suggest approaches to answer each part."
             elif action == "breakdown_assignment":
                 query = f"Break down the assignment '{doc_title}' into smaller, manageable tasks. What steps should I follow?"
             elif action == "explain_assignment":
                 query = f"Explain the requirements and expectations for the assignment '{doc_title}'. What exactly am I supposed to do?"
+            elif action == "complete_quiz":
+                query = f"Help me answer the quiz '{doc_title}'. Based on the course material, provide guidance for answering the quiz questions."
             elif action == "study_quiz":
                 query = f"Help me prepare for the quiz/test '{doc_title}'. What topics should I focus on studying?"
             elif action == "practice_quiz":
                 query = f"Create practice questions based on the material in '{doc_title}' to help me prepare."
-            elif action == "concepts_quiz":
-                query = f"What are the key concepts and topics I should understand for '{doc_title}'?"
-            elif action == "summarize_reading":
+            elif action == "complete_question":
+                # For question type, use the actual question from metadata if available
+                if questions_data:
+                    question_text = questions_data.get('question', doc_title)
+                    question_type = questions_data.get('type', 'unknown')
+
+                    if question_type == 'multiple_choice':
+                        choices = questions_data.get('choices', [])
+                        choices_text = '\n'.join([f"- {choice}" for choice in choices])
+                        query = f"Help me answer this multiple choice question from my course materials:\n\nQuestion: {question_text}\n\nOptions:\n{choices_text}\n\nBased on the course content, which option is correct and why?"
+                    else:
+                        query = f"Help me answer this question from my course materials:\n\nQuestion: {question_text}\n\nProvide a comprehensive answer based on the course content."
+                else:
+                    query = f"Help me answer the question '{doc_title}' using information from my course materials."
+            elif action == "hint_question":
+                if questions_data:
+                    question_text = questions_data.get('question', doc_title)
+                    query = f"Give me a hint to help answer this question (don't give the full answer): {question_text}"
+                else:
+                    query = f"Give me a hint to help answer '{doc_title}' without revealing the full answer."
+            elif action == "summarize_announcement":
+                query = f"Summarize the announcement '{doc_title}' and highlight any important action items or deadlines."
+            elif action == "ask_announcement":
+                query = f"I have questions about the announcement '{doc_title}'. Can you help me understand what it means and what I need to do?"
+            elif action == "summarize_material":
                 query = f"Provide a comprehensive summary of '{doc_title}'"
-            elif action == "questions_reading":
+            elif action == "questions_material":
                 query = f"I have questions about the content in '{doc_title}'. Can you help me understand it better?"
-            elif action == "keypoints_reading":
+            elif action == "keypoints_material":
                 query = f"What are the main key points and important concepts in '{doc_title}'?"
             else:
                 query = f"Help me understand the content in '{doc_title}'"
@@ -1036,13 +1094,25 @@ Choose a setting to modify:
                 if self.rag_pipeline:
                     response = await self._process_query_rag_enhanced(query, user, document_id=doc_id)
 
-                    # Add a helpful header
-                    if action.startswith("help_assignment"):
-                        header = "📝 **Assignment Help**\n\n"
-                    elif action.startswith("study_quiz") or action.startswith("practice_quiz") or action.startswith("concepts_quiz"):
-                        header = "🧠 **Study Assistance**\n\n"
+                    # Add a helpful header with due date if applicable
+                    if action.startswith("complete_assignment"):
+                        header = "✍️ <b>Assignment Completion Assistance</b>\n\n"
+                        if due_date:
+                            header += f"⏰ Due: {due_date.strftime('%B %d, %Y at %I:%M %p')}\n\n"
+                    elif action.startswith("complete_quiz"):
+                        header = "✍️ <b>Quiz Answering Assistance</b>\n\n"
+                        if due_date:
+                            header += f"⏰ Due: {due_date.strftime('%B %d, %Y at %I:%M %p')}\n\n"
+                    elif action.startswith("complete_question"):
+                        header = "✍️ <b>Question Answering Assistance</b>\n\n"
+                        if due_date:
+                            header += f"⏰ Due: {due_date.strftime('%B %d, %Y at %I:%M %p')}\n\n"
+                    elif action.startswith("study_quiz") or action.startswith("practice_quiz"):
+                        header = "🧠 <b>Study Assistance</b>\n\n"
+                    elif action.startswith("summarize_"):
+                        header = "📖 <b>Summary</b>\n\n"
                     else:
-                        header = "📖 **Material Summary**\n\n"
+                        header = ""
 
                     return header + response
                 else:
