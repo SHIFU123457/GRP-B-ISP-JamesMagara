@@ -19,27 +19,51 @@ class GoogleClassroomEmailParser:
     """Parse Google Classroom notification emails to extract material info"""
 
     # Email subject patterns for different material types
+    # Order matters: check more specific patterns first (quiz before assignment)
+    # Each type has patterns for both "New X:" and "New X posted:" formats
     PATTERNS = {
+        'quiz': [
+            r'New quiz assignment:?\s*(.+)',  # "New quiz assignment: Title"
+            r'New quiz assignment posted:?\s*(.+)',
+            r'Quiz assignment:?\s*(.+)',
+            r'Quiz assignment posted:?\s*(.+)',
+            r'New quiz:?\s*(.+)',  # "New quiz: Title"
+            r'New quiz posted:?\s*(.+)',
+            r'Quiz posted:?\s*(.+)',
+            r'(.+)\s+posted a quiz assignment',
+            r'(.+)\s+posted a quiz',
+        ],
+        'question': [
+            r'New question:?\s*(.+)',  # "New question: Title"
+            r'New question posted:?\s*(.+)',
+            r'Question:?\s*(.+)',
+            r'Question posted:?\s*(.+)',
+            r'(.+)\s+posted a question',
+        ],
         'assignment': [
+            r'New assignment:?\s*(.+)',  # "New assignment: Title"
             r'New assignment posted:?\s*(.+)',
+            r'Assignment:?\s*(.+)',
             r'Assignment posted:?\s*(.+)',
             r'(.+)\s+posted an assignment',
         ],
-        'quiz': [
-            r'New quiz posted:?\s*(.+)',
-            r'Quiz posted:?\s*(.+)',
-            r'(.+)\s+posted a quiz',
-        ],
         'announcement': [
-            r'New announcement:?\s*(.+)',
+            r'New announcement:?\s*(.+)',  # "New announcement: Title"
+            r'New announcement posted:?\s*(.+)',
+            r'Announcement:?\s*(.+)',
             r'Announcement posted:?\s*(.+)',
             r'(.+)\s+posted an announcement',
+            r'(.+)\s+made an announcement',
         ],
-        'reading': [
+        'material': [
+            r'New material:?\s*(.+)',  # "New material: Title"
             r'New material posted:?\s*(.+)',
+            r'Material:?\s*(.+)',
             r'Material posted:?\s*(.+)',
+            r'(.+)\s+posted material',
             r'(.+)\s+posted a material',
             r'(.+)\s+shared a file',
+            r'(.+)\s+shared new material',
         ]
     }
 
@@ -50,13 +74,14 @@ class GoogleClassroomEmailParser:
 
         Returns:
             {
-                'material_type': 'assignment'|'quiz'|'announcement'|'reading',
+                'material_type': 'assignment'|'quiz'|'question'|'material'|'announcement',
                 'title': 'Material title'
             }
         """
         if not subject:
             return None
 
+        # Check patterns in order (quiz before assignment is important!)
         for material_type, patterns in cls.PATTERNS.items():
             for pattern in patterns:
                 match = re.search(pattern, subject, re.IGNORECASE)
@@ -67,9 +92,9 @@ class GoogleClassroomEmailParser:
                         'title': title
                     }
 
-        # Default to reading if no specific type matched
+        # Default to material if no specific type matched
         return {
-            'material_type': 'reading',
+            'material_type': 'material',
             'title': subject
         }
 

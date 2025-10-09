@@ -40,14 +40,19 @@ class NotificationService:
             user_telegram_id: Telegram user ID
             course_name: Name of the course
             documents: List of new documents
-            material_type: Type of material (assignment, quiz, reading, announcement)
+            material_type: Type of material (assignment, quiz, question, material, announcement)
         """
         if not documents:
             return
 
         # Determine material type from documents if not provided
         if not material_type and documents:
-            material_type = documents[0].material_type or 'reading'
+            material_type = documents[0].material_type or 'material'
+
+        # Get first document for metadata
+        first_doc = documents[0]
+        due_date = first_doc.due_date if hasattr(first_doc, 'due_date') else None
+        submission_required = first_doc.submission_required if hasattr(first_doc, 'submission_required') else False
 
         # Create notification message based on material type
         if material_type == 'assignment':
@@ -56,6 +61,9 @@ class NotificationService:
         elif material_type == 'quiz':
             emoji = "🧠"
             action = "Quiz posted"
+        elif material_type == 'question':
+            emoji = "❓"
+            action = "Question posted"
         elif material_type == 'announcement':
             emoji = "📢"
             action = "Announcement posted"
@@ -69,6 +77,13 @@ class NotificationService:
 
         message = f"{emoji} **{action} in {escape_markdown(course_name)}:**\n\n{doc_list}"
 
+        # Add due date and submission info if applicable
+        if due_date:
+            message += f"\n\n⏰ **Due:** {due_date.strftime('%B %d, %Y at %I:%M %p')}"
+
+        if submission_required:
+            message += f"\n✅ **Submission Required**"
+
         if extra_count > 0:
             message += f"\n\n*...and {extra_count} more documents*"
 
@@ -81,7 +96,9 @@ class NotificationService:
             'material_type': material_type,
             'document_id': documents[0].id if documents else None,
             'document_title': documents[0].title if documents else None,
-            'course_name': course_name
+            'course_name': course_name,
+            'due_date': due_date,
+            'submission_required': submission_required
         }
 
         self.telegram_notifications.append(notification)
@@ -164,7 +181,7 @@ class SchedulerService:
         # Schedule weekly full sync every Sunday at 3 AM
         schedule.every().sunday.at("03:00").do(self._weekly_full_sync)
 
-        logger.info(f"Scheduled tasks configured - Gmail check every 2 min, LMS sync every {sync_interval} min")
+        logger.info(f"Scheduled tasks configured - Gmail check every 2 min, LMS sync every {sync_interval} hrs")
     
     def _run_scheduler(self):
         """Run the scheduler loop"""
@@ -259,6 +276,8 @@ class SchedulerService:
                                    course_name: str, material_type: str = None):
         """Send notification for specific user and documents (synchronous)"""
         try:
+            from src.data.models import UserNotification
+
             with db_manager.get_session() as session:
                 # Get user's telegram ID
                 user = session.query(User).filter(User.id == user_id).first()
@@ -269,8 +288,16 @@ class SchedulerService:
                 # Reload documents with active session
                 documents = session.query(Document).filter(Document.id.in_(document_ids)).all()
 
-                # Filter out documents that were already notified
-                unsent_docs = [doc for doc in documents if not doc.notification_sent]
+                # Filter out documents that were already notified to this user
+                unsent_docs = []
+                for doc in documents:
+                    user_notification = session.query(UserNotification).filter(
+                        UserNotification.user_id == user_id,
+                        UserNotification.document_id == doc.id
+                    ).first()
+
+                    if not user_notification or not user_notification.notification_sent:
+                        unsent_docs.append(doc)
 
                 if not unsent_docs:
                     logger.debug(f"All documents already notified for user {user_id}")
@@ -284,10 +311,24 @@ class SchedulerService:
                     material_type
                 )
 
-                # Mark documents as notified
+                # Create or update UserNotification records
                 for doc in unsent_docs:
-                    doc.notification_sent = True
-                    doc.notification_sent_at = datetime.now()
+                    user_notification = session.query(UserNotification).filter(
+                        UserNotification.user_id == user_id,
+                        UserNotification.document_id == doc.id
+                    ).first()
+
+                    if user_notification:
+                        user_notification.notification_sent = True
+                        user_notification.notification_sent_at = datetime.now()
+                    else:
+                        new_notification = UserNotification(
+                            user_id=user_id,
+                            document_id=doc.id,
+                            notification_sent=True,
+                            notification_sent_at=datetime.now()
+                        )
+                        session.add(new_notification)
 
                 session.commit()
 
@@ -299,20 +340,21 @@ class SchedulerService:
     def _schedule_notifications_from_sync(self):
         """Send notifications for recently synced documents (fallback method)"""
         try:
+            from src.data.models import UserNotification
+
             with db_manager.get_session() as session:
-                # Get documents that haven't been notified yet (within last hour)
+                # Get documents created within last hour
                 recent_cutoff = datetime.now() - timedelta(hours=1)
 
                 recent_docs = session.query(Document).filter(
-                    Document.created_at >= recent_cutoff,
-                    Document.notification_sent == False
+                    Document.created_at >= recent_cutoff
                 ).all()
 
                 if not recent_docs:
-                    logger.debug("No unnotified recent documents")
+                    logger.debug("No recent documents")
                     return
 
-                logger.info(f"Found {len(recent_docs)} unnotified documents")
+                logger.info(f"Found {len(recent_docs)} recent documents to check for notifications")
 
                 # Group by course
                 docs_by_course = {}
@@ -335,20 +377,48 @@ class SchedulerService:
                     for enrollment in enrollments:
                         user = session.query(User).filter(User.id == enrollment.user_id).first()
                         if user and user.telegram_id:
+                            # Filter documents not yet notified to this user
+                            unsent_docs = []
+                            for doc in documents:
+                                user_notification = session.query(UserNotification).filter(
+                                    UserNotification.user_id == user.id,
+                                    UserNotification.document_id == doc.id
+                                ).first()
+
+                                if not user_notification or not user_notification.notification_sent:
+                                    unsent_docs.append(doc)
+
+                            if not unsent_docs:
+                                continue
+
                             # Determine material type from documents
-                            material_type = documents[0].material_type if documents else 'reading'
+                            material_type = unsent_docs[0].material_type if unsent_docs else 'material'
 
                             self.notification_service.notify_new_materials(
                                 user.telegram_id,
                                 course.course_name,
-                                documents,
+                                unsent_docs,
                                 material_type
                             )
 
-                            # Mark as notified
-                            for doc in documents:
-                                doc.notification_sent = True
-                                doc.notification_sent_at = datetime.now()
+                            # Create or update UserNotification records
+                            for doc in unsent_docs:
+                                user_notification = session.query(UserNotification).filter(
+                                    UserNotification.user_id == user.id,
+                                    UserNotification.document_id == doc.id
+                                ).first()
+
+                                if user_notification:
+                                    user_notification.notification_sent = True
+                                    user_notification.notification_sent_at = datetime.now()
+                                else:
+                                    new_notification = UserNotification(
+                                        user_id=user.id,
+                                        document_id=doc.id,
+                                        notification_sent=True,
+                                        notification_sent_at=datetime.now()
+                                    )
+                                    session.add(new_notification)
 
                 session.commit()
 

@@ -644,9 +644,12 @@ class LMSIntegrationService:
             connector: Google Classroom API connector
             course: Course to sync
             session: Database session
-            include_unnotified: If True, include existing documents that haven't been notified yet
+            include_unnotified: If True, include existing documents that haven't been notified to this user yet
         """
+        from src.data.models import UserNotification
+
         synced_documents = []
+        user_id = connector.user_id  # Get the user ID from connector
 
         try:
             # Get course work and materials
@@ -655,6 +658,69 @@ class LMSIntegrationService:
             ).execute()
 
             for work in coursework.get('courseWork', []):
+                # Determine material type from Google Classroom API
+                work_type = work.get('workType', 'MATERIAL')  # ASSIGNMENT, SHORT_ANSWER_QUESTION, MULTIPLE_CHOICE_QUESTION, MATERIAL
+                work_title = work.get('title', 'Untitled')
+                work_description = work.get('description', '')
+
+                logger.debug(f"Processing courseWork: '{work_title}' with workType='{work_type}'")
+
+                # Map Google Classroom workType to our material_type
+                if work_type == 'ASSIGNMENT':
+                    # Check if it's a quiz based on title or description
+                    title_lower = work_title.lower()
+                    description_lower = work_description.lower()
+
+                    # Keywords that indicate this is a quiz/test
+                    quiz_keywords = ['quiz', 'test', 'exam']
+
+                    if any(keyword in title_lower for keyword in quiz_keywords) or \
+                       any(keyword in description_lower for keyword in quiz_keywords):
+                        material_type = 'quiz'
+                        logger.debug(f"Detected QUIZ assignment: '{work_title}'")
+                    else:
+                        material_type = 'assignment'
+                        logger.debug(f"Detected regular assignment: '{work_title}'")
+                elif work_type in ['SHORT_ANSWER_QUESTION', 'MULTIPLE_CHOICE_QUESTION']:
+                    material_type = 'question'
+                    logger.debug(f"Detected QUESTION: '{work_title}' ({work_type})")
+                else:  # MATERIAL
+                    material_type = 'material'
+                    logger.debug(f"Detected MATERIAL: '{work_title}'")
+                due_date = work.get('dueDate')  # {year, month, day}
+                due_time = work.get('dueTime')  # {hours, minutes}
+                submission_required = work_type in ['ASSIGNMENT', 'SHORT_ANSWER_QUESTION', 'MULTIPLE_CHOICE_QUESTION']
+
+                # Parse due date if exists
+                due_datetime = None
+                if due_date:
+                    try:
+                        due_datetime = datetime(
+                            year=due_date.get('year'),
+                            month=due_date.get('month'),
+                            day=due_date.get('day'),
+                            hour=due_time.get('hours', 23) if due_time else 23,
+                            minute=due_time.get('minutes', 59) if due_time else 59
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to parse due date for {work_title}: {e}")
+
+                # Extract questions for question-type materials
+                questions_data = None
+                if material_type == 'question':
+                    if work_type == 'SHORT_ANSWER_QUESTION':
+                        questions_data = {
+                            'type': 'short_answer',
+                            'question': work_description or work_title
+                        }
+                    elif work_type == 'MULTIPLE_CHOICE_QUESTION':
+                        choices = work.get('multipleChoiceQuestion', {}).get('choices', [])
+                        questions_data = {
+                            'type': 'multiple_choice',
+                            'question': work_description or work_title,
+                            'choices': choices
+                        }
+
                 # Process attachments
                 for material in work.get('materials', []):
                     if 'driveFile' in material:
@@ -692,7 +758,11 @@ class LMSIntegrationService:
                                             lms_document_id=drive_file['id'],
                                             lms_last_modified=datetime.now(),
                                             is_processed=False,
-                                            processing_status="pending"
+                                            processing_status="pending",
+                                            material_type=material_type,
+                                            submission_required=submission_required,
+                                            due_date=due_datetime,
+                                            questions=questions_data
                                         )
                                         session.add(new_document)
                                         session.flush()
@@ -702,10 +772,17 @@ class LMSIntegrationService:
                                 except Exception as e:
                                     logger.error(f"Failed to download document {filename}: {e}")
                                     continue
-                            elif include_unnotified and not existing_doc.notification_sent:
-                                # Gmail-triggered sync: include existing un-notified documents
-                                synced_documents.append(existing_doc)
-                                logger.info(f"Re-queuing existing un-notified document: {filename}")
+                            elif include_unnotified:
+                                # Gmail-triggered sync: check if this user has been notified for this document
+                                user_notification = session.query(UserNotification).filter(
+                                    UserNotification.user_id == user_id,
+                                    UserNotification.document_id == existing_doc.id
+                                ).first()
+
+                                if not user_notification or not user_notification.notification_sent:
+                                    # User hasn't been notified yet - re-queue the document
+                                    synced_documents.append(existing_doc)
+                                    logger.info(f"Re-queuing existing un-notified document for user {user_id}: {filename}")
                         else:
                             logger.debug(f"Skipping unsupported file type '{file_ext}': {filename}")
 
@@ -716,6 +793,64 @@ class LMSIntegrationService:
                 ).execute()
 
                 for announcement in announcements.get('announcements', []):
+                    announcement_id = announcement.get('id')
+                    announcement_text = announcement.get('text', '')
+                    announcement_title = announcement_text[:100] if announcement_text else 'Announcement'  # First 100 chars as title
+
+                    # Check if we already have this announcement text stored
+                    has_attachments = bool(announcement.get('materials'))
+
+                    # If announcement has no attachments, create a text-only document
+                    if not has_attachments and announcement_text:
+                        existing_announcement = session.query(Document).filter(
+                            Document.lms_document_id == announcement_id,
+                            Document.course_id == course.id
+                        ).first()
+
+                        if not existing_announcement:
+                            # Create text file for announcement
+                            announcement_dir = Path("./data/documents") / course.course_code / "announcements"
+                            announcement_dir.mkdir(parents=True, exist_ok=True)
+
+                            # Sanitize filename
+                            safe_title = "".join(c for c in announcement_title if c.isalnum() or c in (' ', '-', '_')).strip()
+                            text_filename = f"{safe_title[:50]}.txt"
+                            text_path = announcement_dir / text_filename
+
+                            # Write announcement text to file
+                            with open(text_path, 'w', encoding='utf-8') as f:
+                                f.write(announcement_text)
+
+                            new_announcement_doc = Document(
+                                course_id=course.id,
+                                title=announcement_title,
+                                file_path=str(text_path),
+                                file_type='txt',
+                                file_size=len(announcement_text.encode('utf-8')),
+                                lms_document_id=announcement_id,
+                                lms_last_modified=datetime.now(),
+                                is_processed=False,
+                                processing_status="pending",
+                                material_type='announcement',
+                                content_text=announcement_text  # Store text directly
+                            )
+                            session.add(new_announcement_doc)
+                            session.flush()
+                            synced_documents.append(new_announcement_doc)
+                            logger.info(f"Added new text-only announcement: {announcement_title}")
+
+                        elif include_unnotified:
+                            # Check if this user has been notified for this announcement
+                            user_notification = session.query(UserNotification).filter(
+                                UserNotification.user_id == user_id,
+                                UserNotification.document_id == existing_announcement.id
+                            ).first()
+
+                            if not user_notification or not user_notification.notification_sent:
+                                # User hasn't been notified yet - re-queue the announcement
+                                synced_documents.append(existing_announcement)
+                                logger.info(f"Re-queuing existing un-notified announcement for user {user_id}: {announcement_title}")
+
                     # Process attachments in announcements
                     for material in announcement.get('materials', []):
                         if 'driveFile' in material:
@@ -764,10 +899,17 @@ class LMSIntegrationService:
                                     except Exception as e:
                                         logger.error(f"Failed to download announcement document {filename}: {e}")
                                         continue
-                                elif include_unnotified and not existing_doc.notification_sent:
-                                    # Gmail-triggered sync: include existing un-notified documents
-                                    synced_documents.append(existing_doc)
-                                    logger.info(f"Re-queuing existing un-notified announcement: {filename}")
+                                elif include_unnotified:
+                                    # Gmail-triggered sync: check if this user has been notified
+                                    user_notification = session.query(UserNotification).filter(
+                                        UserNotification.user_id == user_id,
+                                        UserNotification.document_id == existing_doc.id
+                                    ).first()
+
+                                    if not user_notification or not user_notification.notification_sent:
+                                        # User hasn't been notified yet - re-queue
+                                        synced_documents.append(existing_doc)
+                                        logger.info(f"Re-queuing existing un-notified announcement for user {user_id}: {filename}")
 
             except Exception as announce_error:
                 logger.error(f"Error syncing announcements for course {course.course_name}: {announce_error}")

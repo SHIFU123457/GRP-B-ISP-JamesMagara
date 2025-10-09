@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, Dict, Any
-from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, JSON, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, JSON, ForeignKey, Float, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -141,10 +141,13 @@ class Document(Base):
     lms_document_id = Column(String, index=True)
     lms_last_modified = Column(DateTime(timezone=True))
 
-    # Notification tracking
-    notification_sent = Column(Boolean, default=False)
-    notification_sent_at = Column(DateTime(timezone=True))
-    material_type = Column(String)  # assignment, quiz, reading, announcement
+    # Material classification
+    material_type = Column(String)  # assignment, quiz, question, material, announcement
+
+    # Assignment/Quiz metadata
+    submission_required = Column(Boolean, default=False)  # Whether this requires user submission
+    due_date = Column(DateTime(timezone=True))  # When assignment/quiz is due
+    questions = Column(JSON)  # For question-type materials: {type: 'short_answer'/'multiple_choice', question: str, choices: []}
 
     # Privacy and access control
     is_public = Column(Boolean, default=False)
@@ -157,6 +160,31 @@ class Document(Base):
     # Relationships
     course = relationship("Course", back_populates="documents")
     embeddings = relationship("DocumentEmbedding", back_populates="document")
+    user_notifications = relationship("UserNotification", back_populates="document")
+
+class UserNotification(Base):
+    """Track notifications per user per document for multi-user courses"""
+    __tablename__ = "user_notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
+
+    # Notification status
+    notification_sent = Column(Boolean, default=False, index=True)
+    notification_sent_at = Column(DateTime(timezone=True))
+
+    # Metadata
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    user = relationship("User")
+    document = relationship("Document", back_populates="user_notifications")
+
+    # Ensure one notification record per user per document
+    __table_args__ = (
+        UniqueConstraint('user_id', 'document_id', name='uq_user_document_notification'),
+    )
 
 class DocumentEmbedding(Base):
     """Vector embeddings for documents (for RAG pipeline)"""
