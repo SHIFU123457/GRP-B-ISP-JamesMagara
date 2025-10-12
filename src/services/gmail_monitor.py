@@ -101,25 +101,95 @@ class GoogleClassroomEmailParser:
     @classmethod
     def extract_course_from_body(cls, email_body: str) -> Optional[str]:
         """Extract course name from email body"""
-        # Google Classroom emails have patterns like:
-        # "posted in [Course Name]" or "in [Course Name]"
+        # Google Classroom emails have a specific format:
+        # Notification settings
+        # [Course Name]
+        # New assignment/material/quiz/etc.
 
-        # Try specific patterns first (more reliable)
+        # Try patterns in order of reliability
         patterns = [
-            r'posted\s+in\s+([^\n\r.]+?)(?:\s*\n|\s*\.|\s*$)',  # "posted in CourseName"
-            r'in\s+([A-Z][^\n\r.]+?)(?:\s*posted|\s*shared|\s*\n|\s*\.)',  # "in CourseName posted"
-            r'class:\s*([^\n\r]+)',  # "class: CourseName"
+            # Pattern 1: Course name between URL and URL (most reliable for plain text emails)
+            # Format: <URL>\nCourse Name\n<URL>
+            r'<https://[^>]+>\s*[\r\n]+\s*([A-Z][^\r\n<]{3,80}?)\s*[\r\n]+\s*<https://',
+
+            # Pattern 2: Course name after "Notification settings" line, URL, then course name
+            # Format: Notification settings\n<URL>\nCourse Name\n
+            r'Notification\s+settings\s*[\r\n]+\s*<[^>]+>\s*[\r\n]+\s*([A-Z][^\r\n<]{3,80}?)\s*[\r\n]',
+
+            # Pattern 3: Course name directly before "New [type]" with URL separator
+            r'([A-Z][^\r\n<]{3,60}?)\s*[\r\n]+\s*<[^>]+>\s*[\r\n]+\s*New\s+(?:assignment|material|quiz|announcement|question)',
+
+            # Pattern 4: Traditional "posted in" format (fallback)
+            r'posted\s+in\s+([^\n\r.<]+?)(?:\s*\n|\s*\.|\s*$|\s*<)',
+
+            # Pattern 5: "in [Course]" format (fallback)
+            r'in\s+([A-Z][^\n\r.<]+?)(?:\s*posted|\s*shared|\s*\n|\s*\.|\s*<)',
+
+            # Pattern 6: "class: [Course]" format (fallback)
+            r'class:\s*([^\n\r<]+)',
         ]
 
-        for pattern in patterns:
-            match = re.search(pattern, email_body, re.IGNORECASE)
+        for i, pattern in enumerate(patterns, 1):
+            match = re.search(pattern, email_body, re.IGNORECASE | re.MULTILINE)
             if match:
                 course_name = match.group(1).strip()
-                # Filter out common false matches (addresses, etc.)
-                if len(course_name) > 3 and not re.search(r'\d{5}', course_name):  # Not a ZIP code
+
+                # Clean up course name
+                course_name = cls._clean_course_name(course_name)
+
+                # Validate course name
+                if cls._is_valid_course_name(course_name):
+                    logger.debug(f"Extracted course name using pattern {i}: '{course_name}'")
                     return course_name
 
+        logger.debug("Could not extract course name from email body")
         return None
+
+    @classmethod
+    def _clean_course_name(cls, course_name: str) -> str:
+        """Clean extracted course name"""
+        # Remove common unwanted text
+        unwanted = ['Classroom Logo', 'Notification settings', 'See details', 'Posted on']
+        for text in unwanted:
+            course_name = course_name.replace(text, '')
+
+        # Strip whitespace and tabs
+        course_name = course_name.strip()
+
+        return course_name
+
+    @classmethod
+    def _is_valid_course_name(cls, course_name: str) -> bool:
+        """Validate if extracted text is a valid course name"""
+        if not course_name or len(course_name) < 3:
+            return False
+
+        # Filter out common false matches
+        invalid_patterns = [
+            r'^\d{5}',  # ZIP codes
+            r'\d{5}\s+(USA|CA|United States)',  # US/CA addresses (ZIP + country)
+            r'^(settings|notification|logo|details|see details)$',  # UI text
+            r'^http',  # URLs
+            r'^\d{1,2}:\d{2}',  # Times
+            r'@',  # Email addresses (contains @)
+            r'&Email=',  # URL parameters with emails
+            r'^\s*$',  # Empty or whitespace only
+            r'Posted on',  # Timestamp lines
+            r'\(EAT\)|\(GMT\)|\(UTC\)',  # Timezone indicators
+            r'^[\w\.-]+@[\w\.-]+',  # Email format (starts with email)
+            r',\s*(CA|NY|TX|FL|WA)\s+\d{5}',  # US addresses (City, State ZIP)
+            r'Mountain View|Menlo Park|Palo Alto|San Francisco',  # Google office locations
+            r'USA$|Canada$',  # Ends with country name
+            r'^\d+\s+[A-Z][a-z]+\s+(Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd)',  # Street addresses
+            r'^[A-Z][a-z]+,\s*[A-Z]{2}\s+\d{5}',  # City, State ZIP format
+        ]
+
+        for pattern in invalid_patterns:
+            if re.search(pattern, course_name, re.IGNORECASE):
+                logger.debug(f"Rejected course name '{course_name}' - matched invalid pattern: {pattern}")
+                return False
+
+        return True
 
     @classmethod
     def extract_classroom_link(cls, email_body: str) -> Optional[str]:
@@ -282,10 +352,15 @@ class GmailMonitorService:
             course_name = self.parser.extract_course_from_body(body)
             classroom_link = self.parser.extract_classroom_link(body)
 
-            # Debug logging
-            logger.debug(f"Email body preview: {body[:200]}...")
-            logger.debug(f"Extracted course_name: '{course_name}'")
-            logger.debug(f"Extracted link: '{classroom_link}'")
+            # Enhanced debug logging for course extraction
+            if course_name:
+                logger.info(f"✅ Extracted course name: '{course_name}' from email")
+            else:
+                logger.warning(f"❌ Could not extract course name from email. Subject: '{subject}'")
+                # Only show email body when extraction fails (for debugging)
+                logger.debug(f"Email body preview:\n{body[:500]}")
+
+            logger.debug(f"Extracted classroom link: '{classroom_link}'")
 
             # Get email timestamp
             timestamp = datetime.fromtimestamp(int(msg['internalDate']) / 1000)

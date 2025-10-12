@@ -388,12 +388,12 @@ Please check the system status or try again later.
 /settings - Adjust your preferences
 
 **LMS Integration:**
-/connect_classroom - Connect your Google Classroom
-/disconnect_classroom - Disconnect Google Classroom
+/connect\\_classroom - Connect your Google Classroom
+/disconnect\\_classroom - Disconnect Google Classroom
 /connections - View connection status
 /sync - Manually sync with your LMS
 /status - View system status
-/process_docs - Force document processing
+/process\\_docs - Force document processing
 
 **How to Use:**
 📝 **Ask Questions**: Just type your question naturally
@@ -413,7 +413,7 @@ Please check the system status or try again later.
 • Use /settings to customize your experience
 
 **Getting Started:**
-1. Use /connect_classroom to link your Google account
+1. Use /connect\\_classroom to link your Google account
 2. Use /courses to see your classes
 3. Ask questions about your materials
 4. Rate responses to improve personalization

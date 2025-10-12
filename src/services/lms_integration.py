@@ -652,7 +652,7 @@ class LMSIntegrationService:
         user_id = connector.user_id  # Get the user ID from connector
 
         try:
-            # Get course work and materials
+            # PART 1: Get course work (assignments, quizzes, questions, materials posted as coursework)
             coursework = connector.service.courses().courseWork().list(
                 courseId=course.lms_course_id
             ).execute()
@@ -914,6 +914,88 @@ class LMSIntegrationService:
             except Exception as announce_error:
                 logger.error(f"Error syncing announcements for course {course.course_name}: {announce_error}")
 
+            # PART 3: Sync courseMaterials (materials posted directly, NOT as coursework/assignment)
+            # Note: These are materials teachers post directly to "Classwork" without making them assignments
+            try:
+                course_materials = connector.service.courses().courseWorkMaterials().list(
+                    courseId=course.lms_course_id
+                ).execute()
+
+                material_count = len(course_materials.get('courseWorkMaterial', []))
+                logger.info(f"Found {material_count} courseMaterials in {course.course_name}")
+
+                for material_item in course_materials.get('courseWorkMaterial', []):
+                    material_id = material_item.get('id')
+                    material_title = material_item.get('title', 'Untitled Material')
+                    material_description = material_item.get('description', '')
+
+                    logger.debug(f"Processing courseMaterial: '{material_title}'")
+
+                    # Process attachments in course materials
+                    for material in material_item.get('materials', []):
+                        if 'driveFile' in material:
+                            drive_file = material['driveFile']['driveFile']
+
+                            # Check if it's a supported file type
+                            filename = drive_file.get('title') or drive_file.get('name', 'Unknown')
+                            if not filename or filename == 'Unknown':
+                                logger.warning(f"Skipping course material file with no title in course {course.course_name}")
+                                continue
+
+                            file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
+
+                            if file_ext in settings.SUPPORTED_FILE_TYPES:
+                                # Check if document already exists
+                                existing_doc = session.query(Document).filter(
+                                    Document.lms_document_id == drive_file['id'],
+                                    Document.course_id == course.id
+                                ).first()
+
+                                if not existing_doc:
+                                    # Download new document
+                                    try:
+                                        local_path = self._download_google_drive_file(
+                                            connector, drive_file, course, filename
+                                        )
+
+                                        if local_path:
+                                            new_document = Document(
+                                                course_id=course.id,
+                                                title=filename,
+                                                file_path=local_path,
+                                                file_type=file_ext,
+                                                file_size=0,
+                                                lms_document_id=drive_file['id'],
+                                                lms_last_modified=datetime.now(),
+                                                is_processed=False,
+                                                processing_status="pending",
+                                                material_type='material'  # Materials are always type 'material'
+                                            )
+                                            session.add(new_document)
+                                            session.flush()
+                                            synced_documents.append(new_document)
+                                            logger.info(f"Added new course material: {filename}")
+
+                                    except Exception as e:
+                                        logger.error(f"Failed to download course material {filename}: {e}")
+                                        continue
+                                elif include_unnotified:
+                                    # Gmail-triggered sync: check if this user has been notified
+                                    user_notification = session.query(UserNotification).filter(
+                                        UserNotification.user_id == user_id,
+                                        UserNotification.document_id == existing_doc.id
+                                    ).first()
+
+                                    if not user_notification or not user_notification.notification_sent:
+                                        # User hasn't been notified yet - re-queue
+                                        synced_documents.append(existing_doc)
+                                        logger.info(f"Re-queuing existing un-notified course material for user {user_id}: {filename}")
+                            else:
+                                logger.debug(f"Skipping unsupported file type '{file_ext}' in course material: {filename}")
+
+            except Exception as course_material_error:
+                logger.error(f"Error syncing course materials for course {course.course_name}: {course_material_error}")
+
         except Exception as e:
             logger.error(f"Error syncing materials for course {course.course_name}: {e}")
 
@@ -1040,13 +1122,15 @@ class LMSIntegrationService:
                         if (course_name_hint.lower() in course.course_name.lower() or
                             course.course_name.lower() in course_name_hint.lower()):
                             target_courses.append(course)
+                            logger.debug(f"Matched course '{course.course_name}' with hint '{course_name_hint}'")
 
                     if not target_courses:
                         logger.warning(f"Could not match course hint '{course_name_hint}' for user {user_id}")
                         # Fall back to syncing all courses
                         target_courses = [e.course for e in enrollments]
                 else:
-                    # No hint - sync all courses
+                    # No hint provided - sync all courses
+                    logger.info(f"No course hint provided - syncing all {len(enrollments)} courses")
                     target_courses = [e.course for e in enrollments]
 
                 logger.info(f"Triggering sync for {len(target_courses)} course(s) for user {user_id}")

@@ -96,56 +96,97 @@ class RAGPipeline:
     
     @retry_with_backoff(max_retries=3, base_delay=2.0)
     def process_and_store_document(self, document_id: int) -> bool:
-        """Process a document and store its embeddings"""
+        """Process a document and store its embeddings with batch commits to avoid timeouts"""
+        BATCH_COMMIT_SIZE = 50  # Commit every 50 chunks to avoid Supabase connection timeouts
+
         try:
+            # First, get document metadata in a quick session
             with db_manager.get_session() as session:
-                # Get document from database
                 document = session.query(Document).filter(Document.id == document_id).first()
-                
+
                 if not document:
                     logger.error(f"Document with ID {document_id} not found")
                     return False
-                
+
                 if not document.file_path or not Path(document.file_path).exists():
                     logger.error(f"Document file not found: {document.file_path}")
                     return False
-                
-                # Process document into chunks
-                metadata = {
-                    'document_id': document.id,
-                    'title': document.title,
-                    'course_id': document.course_id,
-                    'file_type': document.file_type,
-                    'course_code': document.course.course_code if document.course else 'Unknown'
-                }
-                
-                chunks = self.document_processor.process_document(
-                    document.file_path, 
-                    document.file_type, 
-                    metadata
-                )
-                
-                if not chunks:
-                    logger.error(f"No chunks created from document {document_id}")
-                    return False
-                
-                # Create embeddings and store in vector database
-                stored_count = 0
-                for chunk in chunks:
-                    if self._store_chunk_embedding(chunk, document_id, session):
-                        stored_count += 1
-                
-                # Update document status
-                document.is_processed = True
-                document.processing_status = "completed"
-                document.content_text = chunks[0]['text'][:1000] + "..." if chunks else ""
-                
+
+                # Mark as processing
+                document.processing_status = "processing"
                 session.commit()
-                logger.info(f"Successfully processed document {document_id}: {stored_count} chunks stored")
-                return True
-                
+
+                # Cache metadata before session closes
+                doc_path = document.file_path
+                doc_type = document.file_type
+                doc_title = document.title
+                doc_course_id = document.course_id
+                doc_course_code = document.course.course_code if document.course else 'Unknown'
+
+            # Process document into chunks (outside database session)
+            metadata = {
+                'document_id': document_id,
+                'title': doc_title,
+                'course_id': doc_course_id,
+                'file_type': doc_type,
+                'course_code': doc_course_code
+            }
+
+            chunks = self.document_processor.process_document(
+                doc_path,
+                doc_type,
+                metadata
+            )
+
+            if not chunks:
+                logger.error(f"No chunks created from document {document_id}")
+                return False
+
+            total_chunks = len(chunks)
+            logger.info(f"Processing {total_chunks} chunks for document {document_id} in batches of {BATCH_COMMIT_SIZE}")
+
+            # Process chunks in batches with separate sessions to avoid connection timeouts
+            stored_count = 0
+            for i in range(0, total_chunks, BATCH_COMMIT_SIZE):
+                batch = chunks[i:i + BATCH_COMMIT_SIZE]
+                batch_num = (i // BATCH_COMMIT_SIZE) + 1
+                total_batches = (total_chunks + BATCH_COMMIT_SIZE - 1) // BATCH_COMMIT_SIZE
+
+                logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} chunks) for document {document_id}")
+
+                # Use a fresh session for each batch
+                with db_manager.get_session() as batch_session:
+                    for chunk in batch:
+                        if self._store_chunk_embedding(chunk, document_id, batch_session):
+                            stored_count += 1
+
+                    # Commit this batch
+                    batch_session.commit()
+                    logger.debug(f"✅ Batch {batch_num}/{total_batches} committed: {stored_count}/{total_chunks} chunks stored")
+
+            # Final update: mark as completed in a final session
+            with db_manager.get_session() as final_session:
+                document = final_session.query(Document).filter(Document.id == document_id).first()
+                if document:
+                    document.is_processed = True
+                    document.processing_status = "completed"
+                    document.content_text = chunks[0]['text'][:1000] + "..." if chunks else ""
+                    final_session.commit()
+
+            logger.info(f"✅ Successfully processed document {document_id}: {stored_count}/{total_chunks} chunks stored")
+            return True
+
         except Exception as e:
             logger.error(f"Error processing document {document_id}: {e}")
+            # Try to mark as failed
+            try:
+                with db_manager.get_session() as error_session:
+                    document = error_session.query(Document).filter(Document.id == document_id).first()
+                    if document:
+                        document.processing_status = "failed"
+                        error_session.commit()
+            except Exception as mark_error:
+                logger.error(f"Failed to mark document as failed: {mark_error}")
             return False
     
     @retry_with_backoff(max_retries=2, base_delay=1.0)
