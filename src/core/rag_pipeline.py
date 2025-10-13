@@ -568,15 +568,285 @@ class RAGPipeline:
         else:
             return 'low'
         
+    def generate_quiz_questions(self, document_id: Optional[int] = None, topic: Optional[str] = None, num_questions: int = 5) -> List[Dict[str, Any]]:
+        """Generate quiz questions from document or topic using RAG and LLM
+
+        Returns list of question objects:
+        [
+            {
+                'question': 'What is...?',
+                'options': ['Option A', 'Option B', 'Option C', 'Option D'],
+                'correct_answer_index': 0,
+                'explanation': 'The correct answer is A because...'
+            },
+            ...
+        ]
+        """
+        try:
+            # Retrieve relevant content
+            if document_id:
+                # Get content from specific document
+                query = f"Generate comprehensive quiz questions covering the key concepts from this document"
+                context_data = self.generate_context(query, document_id=document_id)
+                source_description = f"document ID {document_id}"
+            elif topic:
+                # Get content from topic search
+                query = f"Generate quiz questions about {topic}"
+                context_data = self.generate_context(query)
+                source_description = f"topic '{topic}'"
+            else:
+                logger.error("Either document_id or topic must be provided")
+                return []
+
+            if not context_data.get('has_relevant_content'):
+                logger.warning(f"No relevant content found for {source_description}")
+                return []
+
+            context = context_data['context']
+
+            # Create prompt for question generation
+            prompt = f"""Based on the following course materials, generate {num_questions} multiple-choice quiz questions to test student understanding.
+
+COURSE MATERIALS:
+{context[:4000]}
+
+REQUIREMENTS:
+1. Generate exactly {num_questions} multiple-choice questions
+2. Each question should have 4 options (A, B, C, D)
+3. Only ONE option should be correct
+4. Include a brief explanation for why the correct answer is right
+5. Questions should test understanding, not just memorization
+6. Focus on key concepts and important details from the material
+
+FORMAT YOUR RESPONSE EXACTLY LIKE THIS (do not deviate from this format):
+QUESTION 1: [Your question here]
+A) [First option]
+B) [Second option]
+C) [Third option]
+D) [Fourth option]
+CORRECT: [A/B/C/D]
+EXPLANATION: [Why this answer is correct]
+
+QUESTION 2: [Your question here]
+A) [First option]
+B) [Second option]
+C) [Third option]
+D) [Fourth option]
+CORRECT: [A/B/C/D]
+EXPLANATION: [Why this answer is correct]
+
+[Continue for all {num_questions} questions...]
+
+Now generate the questions:"""
+
+            # Use LLM to generate questions
+            llm_response = self.llm_service.generate_response(
+                query="Generate quiz questions",
+                context=prompt,
+                user_preferences=None
+            )
+
+            # Log the raw LLM response for debugging
+            logger.info(f"Raw LLM response (first 500 chars): {llm_response[:500]}")
+
+            # Parse the LLM response into structured questions
+            questions = self._parse_quiz_questions(llm_response)
+
+            # If parsing failed completely, try a simpler prompt format
+            if len(questions) == 0:
+                logger.warning("First attempt failed. Trying simplified prompt format...")
+                simplified_prompt = f"""Based on this material, create {num_questions} multiple choice questions.
+
+MATERIAL:
+{context[:3000]}
+
+For each question, use this EXACT format:
+
+1. [Question text here]
+A. [Option 1]
+B. [Option 2]
+C. [Option 3]
+D. [Option 4]
+CORRECT: [A/B/C/D]
+EXPLANATION: [Why this is correct]
+
+2. [Question text here]
+A. [Option 1]
+B. [Option 2]
+C. [Option 3]
+D. [Option 4]
+CORRECT: [A/B/C/D]
+EXPLANATION: [Why this is correct]
+
+Generate {num_questions} questions now:"""
+
+                llm_response = self.llm_service.generate_response(
+                    query="Generate quiz questions",
+                    context=simplified_prompt,
+                    user_preferences=None
+                )
+                logger.info(f"Simplified LLM response (first 500 chars): {llm_response[:500]}")
+                questions = self._parse_quiz_questions(llm_response)
+
+            if len(questions) < num_questions:
+                logger.warning(f"Generated {len(questions)} questions, expected {num_questions}")
+                if len(questions) == 0:
+                    logger.error(f"LLM failed to generate parseable questions. Final response: {llm_response[:1000]}")
+
+            logger.info(f"Successfully generated {len(questions)} quiz questions for {source_description}")
+            return questions
+
+        except Exception as e:
+            logger.error(f"Error generating quiz questions: {e}")
+            return []
+
+    def _parse_quiz_questions(self, llm_response: str) -> List[Dict[str, Any]]:
+        """Parse LLM response into structured question objects - more robust parsing"""
+        questions = []
+
+        try:
+            import re
+
+            # Try multiple parsing strategies
+
+            # Strategy 1: Standard format with "QUESTION N:"
+            question_blocks = re.split(r'(?:QUESTION|Question)\s*\d+\s*:', llm_response, flags=re.IGNORECASE)[1:]
+
+            if not question_blocks or len(question_blocks) < 2:
+                # Strategy 2: Use regex to find all question blocks
+                # Pattern: number followed by period, then text with A/B/C/D options
+                # More robust: find patterns like "N. [text]... A. ... B. ... C. ... D. ... CORRECT"
+
+                # First normalize: ensure questions start on new lines
+                # Replace patterns like "questions: 1." with "questions:\n1."
+                normalized = re.sub(r'(:|\.)(\s*)(\d+\.)', r'\1\n\3', llm_response)
+
+                # Now extract question blocks by finding "N. " followed by content until next "N. " or end
+                question_pattern = r'(\d+\.\s+.+?(?=\d+\.\s+|$))'
+                potential_blocks = re.findall(question_pattern, normalized, re.DOTALL)
+
+                # Filter blocks that look like actual questions (have options A, B, C, D)
+                question_blocks = []
+                for block in potential_blocks:
+                    # Check if block has all required components
+                    has_options = all(re.search(rf'{letter}[\.\)]', block, re.IGNORECASE) for letter in ['A', 'B', 'C', 'D'])
+                    has_correct = re.search(r'CORRECT', block, re.IGNORECASE)
+
+                    if has_options and has_correct:
+                        question_blocks.append(block.strip())
+
+                logger.info(f"Strategy 2: Found {len(question_blocks)} blocks using numbered format")
+
+            if not question_blocks:
+                logger.warning("Could not split LLM response into question blocks")
+                logger.debug(f"Full LLM response for debugging: {llm_response}")
+                return []
+
+            logger.info(f"Successfully split into {len(question_blocks)} question blocks")
+
+            for block_idx, block in enumerate(question_blocks):
+                try:
+                    # CRITICAL FIX: LLM often puts everything on one line
+                    # Add newlines before options (A., B., C., D.) and keywords (CORRECT, EXPLANATION)
+                    block = re.sub(r'\s+([A-D][\.\)])', r'\n\1', block)  # Add newline before A. B. C. D.
+                    block = re.sub(r'\s+(CORRECT|Correct answer):', r'\n\1:', block, flags=re.IGNORECASE)
+                    block = re.sub(r'\s+(EXPLANATION|Explanation):', r'\n\1:', block, flags=re.IGNORECASE)
+
+                    lines = [line.strip() for line in block.strip().split('\n') if line.strip()]
+
+                    if len(lines) < 5:  # Minimum: question + 4 options + correct (explanation optional)
+                        logger.warning(f"Block {block_idx} has too few lines ({len(lines)}). Block: {block[:200]}")
+                        continue
+
+                    # Extract question text (first non-empty line, remove number prefix if present)
+                    question_text = lines[0]
+                    # Remove leading number like "1. " from question text
+                    question_text = re.sub(r'^\d+\.\s*', '', question_text)
+
+                    # Extract options - be more flexible with formats
+                    options = []
+                    # Match patterns like "A)", "A.", "A:", "a)", etc.
+                    option_pattern = re.compile(r'^([A-Da-d])[\)\.\:]\s*(.+)', re.IGNORECASE)
+
+                    for line in lines[1:]:
+                        match = option_pattern.match(line)
+                        if match:
+                            options.append(match.group(2).strip())
+                        if len(options) == 4:
+                            break
+
+                    if len(options) != 4:
+                        logger.warning(f"Block {block_idx}: Found {len(options)} options (expected 4). Lines: {lines[:10]}")
+                        continue
+
+                    # Extract correct answer - try multiple formats
+                    # Search in the entire block text, not line by line
+                    block_text = '\n'.join(lines)
+                    correct_line = None
+                    correct_patterns = [
+                        r'CORRECT\s*:?\s*([A-D])',  # CORRECT: A
+                        r'Correct\s+answer\s*:?\s*([A-D])',  # Correct answer: A
+                        r'Answer\s*:?\s*([A-D])',  # Answer: A
+                        r'EXPLANATION\s*:?\s*CORRECT\s*:?\s*([A-D])',  # EXPLANATION: CORRECT: B
+                    ]
+
+                    for pattern in correct_patterns:
+                        match = re.search(pattern, block_text, re.IGNORECASE)
+                        if match:
+                            correct_line = match.group(1).upper()
+                            break
+
+                    if not correct_line:
+                        logger.warning(f"Block {block_idx}: No correct answer found. Block preview: {block_text[:200]}")
+                        # Default to first option if we can't find correct answer
+                        correct_line = 'A'
+
+                    correct_index = ord(correct_line) - ord('A') if correct_line in 'ABCD' else 0
+
+                    # Extract explanation - try multiple formats
+                    explanation = "No explanation provided"
+                    explanation_patterns = [
+                        r'EXPLANATION\s*:?\s*(.+)',
+                        r'Explanation\s*:?\s*(.+)',
+                        r'Because\s+(.+)',
+                    ]
+
+                    for line in lines:
+                        for pattern in explanation_patterns:
+                            match = re.search(pattern, line, re.IGNORECASE)
+                            if match:
+                                explanation = match.group(1).strip()
+                                break
+                        if explanation != "No explanation provided":
+                            break
+
+                    questions.append({
+                        'question': question_text,
+                        'options': options,
+                        'correct_answer_index': correct_index,
+                        'explanation': explanation
+                    })
+
+                    logger.debug(f"Successfully parsed question {len(questions)}: {question_text[:50]}...")
+
+                except Exception as parse_error:
+                    logger.warning(f"Error parsing question block {block_idx}: {parse_error}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error parsing quiz questions from LLM response: {e}")
+
+        return questions
+
     def get_vector_store_stats(self) -> Dict[str, Any]:
         """Get statistics about the vector store"""
         try:
             count = self.collection.count()
-            
+
             with db_manager.get_session() as session:
                 processed_docs = session.query(Document).filter(Document.is_processed == True).count()
                 total_docs = session.query(Document).count()
-            
+
             return {
                 'total_embeddings': count,
                 'processed_documents': processed_docs,
@@ -584,7 +854,7 @@ class RAGPipeline:
                 'processing_rate': f"{(processed_docs/total_docs*100):.1f}%" if total_docs > 0 else "0%",
                 'llm_service_available': self.llm_service is not None
             }
-            
+
         except Exception as e:
             logger.error(f"Error getting vector store stats: {e}")
             return {

@@ -253,29 +253,60 @@ class SystemLog(Base):
 class PersonalizationProfile(Base):
     """Detailed personalization profile for each user"""
     __tablename__ = "personalization_profiles"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    
+
     # Learning analytics
     avg_session_duration = Column(Float, default=0.0)  # minutes
     preferred_response_length = Column(String, default="medium")  # short, medium, long
     question_complexity_level = Column(Float, default=0.5)  # 0-1 scale
-    
+
     # Interaction patterns
     most_active_hours = Column(JSON)  # list of hours when user is most active
     preferred_subjects = Column(JSON)  # list of subjects user asks about most
     learning_pace = Column(String, default="medium")  # slow, medium, fast
-    
+
     # Performance tracking
     total_interactions = Column(Integer, default=0)
     successful_interactions = Column(Integer, default=0)  # based on user ratings
     last_interaction = Column(DateTime(timezone=True))
-    
+
     # Model data (for ML algorithms)
     feature_vector = Column(JSON)  # cached features for ML models
     last_model_update = Column(DateTime(timezone=True))
-    
+
     # Metadata
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+class QuizSession(Base):
+    """Track active quiz sessions for users"""
+    __tablename__ = "quiz_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=True)  # Null if topic-based quiz
+
+    # Quiz details
+    topic = Column(String)  # The topic being quizzed on (if not document-specific)
+    questions = Column(JSON, nullable=False)  # List of question objects with options, correct answer, explanation
+    current_question_index = Column(Integer, default=0)
+    total_questions = Column(Integer, nullable=False)
+
+    # State tracking
+    is_active = Column(Boolean, default=True)
+    is_paused = Column(Boolean, default=False)
+
+    # Performance tracking
+    correct_answers = Column(Integer, default=0)
+    wrong_answers = Column(Integer, default=0)
+
+    # Metadata
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_interaction_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True))
+
+    # Relationships
+    user = relationship("User")
+    document = relationship("Document")
