@@ -735,10 +735,12 @@ class LMSIntegrationService:
                         file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
 
                         if file_ext in settings.SUPPORTED_FILE_TYPES:
-                            # Check if document already exists
+                            # Check if document already exists FOR THIS USER
+                            # IMPORTANT: Include user_id to prevent duplicate documents across users
                             existing_doc = session.query(Document).filter(
                                 Document.lms_document_id == drive_file['id'],
-                                Document.course_id == course.id
+                                Document.course_id == course.id,
+                                Document.user_id == user_id  # FIX: Added user_id check for proper deduplication
                             ).first()
 
                             if not existing_doc:
@@ -750,6 +752,7 @@ class LMSIntegrationService:
 
                                     if local_path:
                                         new_document = Document(
+                                            user_id=user_id, # FIX: Added user_id for data isolation
                                             course_id=course.id,
                                             title=filename,
                                             file_path=local_path,
@@ -865,10 +868,12 @@ class LMSIntegrationService:
                             file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
 
                             if file_ext in settings.SUPPORTED_FILE_TYPES:
-                                # Check if document already exists
+                                # Check if document already exists FOR THIS USER
+                                # IMPORTANT: Include user_id to prevent duplicate documents across users
                                 existing_doc = session.query(Document).filter(
                                     Document.lms_document_id == drive_file['id'],
-                                    Document.course_id == course.id
+                                    Document.course_id == course.id,
+                                    Document.user_id == user_id  # FIX: Added user_id check for proper deduplication
                                 ).first()
 
                                 if not existing_doc:
@@ -880,6 +885,7 @@ class LMSIntegrationService:
 
                                         if local_path:
                                             new_document = Document(
+                                                user_id=user_id, # FIX: Added user_id for data isolation
                                                 course_id=course.id,
                                                 title=filename,
                                                 file_path=local_path,
@@ -945,10 +951,12 @@ class LMSIntegrationService:
                             file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
 
                             if file_ext in settings.SUPPORTED_FILE_TYPES:
-                                # Check if document already exists
+                                # Check if document already exists FOR THIS USER
+                                # IMPORTANT: Include user_id to prevent duplicate documents across users
                                 existing_doc = session.query(Document).filter(
                                     Document.lms_document_id == drive_file['id'],
-                                    Document.course_id == course.id
+                                    Document.course_id == course.id,
+                                    Document.user_id == user_id  # FIX: Added user_id check for proper deduplication
                                 ).first()
 
                                 if not existing_doc:
@@ -960,6 +968,7 @@ class LMSIntegrationService:
 
                                         if local_path:
                                             new_document = Document(
+                                                user_id=user_id, # FIX: Added user_id for data isolation
                                                 course_id=course.id,
                                                 title=filename,
                                                 file_path=local_path,

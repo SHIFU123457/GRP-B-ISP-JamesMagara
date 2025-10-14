@@ -774,7 +774,11 @@ Choose a setting to modify:
             query_lower = query_text.lower()
             quiz_keywords = [
                 'quiz me', 'ask me questions', 'test me', 'generate questions',
-                'quiz on', 'questions on', 'questions about', 'test my knowledge'
+                'quiz on', 'questions on', 'questions about', 'test my knowledge',
+                'question me on', 'question me about', 'question me regarding',
+                'provide a quiz', 'provide quiz', 'format a quiz', 'formate a quiz',
+                'create a quiz', 'create quiz', 'give me a quiz', 'make a quiz',
+                'another quiz', 'new quiz', 'start a quiz', 'begin a quiz'
             ]
 
             is_quiz_request = any(keyword in query_lower for keyword in quiz_keywords)
@@ -1027,9 +1031,6 @@ Choose a setting to modify:
             elif callback_data.startswith("quiz_answer_"):
                 await self._handle_quiz_answer(update, context, callback_data)
 
-            elif callback_data.startswith("quiz_explain_"):
-                await self._handle_quiz_explanation(update, context, callback_data)
-
             elif callback_data.startswith("quiz_continue_"):
                 await self._handle_quiz_continue(update, context, callback_data)
 
@@ -1229,18 +1230,18 @@ Choose a setting to modify:
                     delattr(self, '_last_searched_doc_title')
 
             # Determine course context from query
-            # Priority: document_id > no filter (search all)
-            # Course filtering disabled because many enrolled courses have no documents
-            course_id = None
+            course_id = self._extract_course_context(query, user)
             if not document_id:
                 # If user explicitly mentioned a document that wasn't found,
                 # don't filter by course - search all documents for related content
                 if searched_doc_title:
-                    logger.info(f"Document '{searched_doc_title}' not found - searching ALL documents without course filter")
+                    logger.info(f"Document '{searched_doc_title}' not found - searching ALL user documents without course filter")
+                    course_id = None # Override course context to search all
                 else:
-                    # Always search all documents - don't restrict by course
-                    # This ensures we find relevant content even if user's active course is empty
-                    logger.info(f"No specific document - searching ALL documents (course filter disabled for better coverage)")
+                    if course_id:
+                        logger.info(f"Course context found: {course_id}. Searching within this course.")
+                    else:
+                        logger.info(f"No specific document or course - searching ALL documents for user {user.id}")
 
             # Get user preferences for personalization
             user_preferences = {
@@ -1252,6 +1253,7 @@ Choose a setting to modify:
             # Generate RAG response using the enhanced pipeline
             rag_result = self.rag_pipeline.generate_rag_response(
                 query,
+                user_id=user.id, # Pass user_id for data isolation
                 course_id=course_id,
                 document_id=document_id,
                 user_preferences=user_preferences
@@ -1363,20 +1365,7 @@ Choose a setting to modify:
                     if course:
                         return course.id
         
-        # If no explicit course found, try to get user's most active course
-        try:
-            with db_manager.get_session() as session:
-                # Get user's most recent course enrollment
-                recent_enrollment = session.query(CourseEnrollment).filter(
-                    CourseEnrollment.user_id == user.id,
-                    CourseEnrollment.is_active == True
-                ).order_by(CourseEnrollment.enrollment_date.desc()).first()
-                
-                if recent_enrollment:
-                    return recent_enrollment.course_id
-        except Exception as e:
-            logger.warning(f"Could not determine user's active course: {e}")
-        
+        # If no explicit course found, return None. The automatic fallback has been removed.
         return None
 
     async def _generate_rag_response(self, query: str, rag_context: Dict[str, Any], user: User) -> str:
@@ -1667,13 +1656,34 @@ Use /help for available commands!
 
         query_lower = query_text.lower()
 
-        # Patterns to extract topic
+        # Patterns to extract topic - ordered from most specific to least specific
         patterns = [
+            # "quiz me on/about X"
             r'quiz me (?:on|about|regarding)\s+(.+)',
+            # "ask me questions on/about X"
             r'ask me questions (?:on|about|regarding)\s+(.+)',
+            # "test me on/about X"
             r'test me (?:on|about|regarding)\s+(.+)',
+            # "generate questions on/about X"
             r'generate questions (?:on|about|regarding)\s+(.+)',
-            # r'questions (?:on|about|regarding)\s+(.+)',
+            # "question me on/about X"
+            r'question me (?:on|about|regarding)\s+(.+)',
+            # "provide a quiz on/about X"
+            r'provide (?:a )?quiz (?:on|about|regarding)\s+(.+)',
+            # "format/formate a quiz on X"
+            r'forma?te? (?:a |another )?quiz (?:on|about|regarding)\s+(.+)',
+            # "create a quiz on X"
+            r'create (?:a |another )?quiz (?:on|about|regarding)\s+(.+)',
+            # "give me a quiz on X"
+            r'give me (?:a )?quiz (?:on|about|regarding)\s+(.+)',
+            # "another quiz on X" or "new quiz on X"
+            r'(?:another|new) quiz (?:on|about|regarding)\s+(.+)',
+            # "start a quiz on X"
+            r'(?:start|begin) (?:a )?quiz (?:on|about|regarding)\s+(.+)',
+            # Fallback: "quiz on X" (no "me")
+            r'quiz (?:on|about|regarding)\s+(.+)',
+            # Fallback: "questions on X"
+            r'questions (?:on|about|regarding)\s+(.+)',
         ]
 
         for pattern in patterns:
@@ -1716,7 +1726,7 @@ Use /help for available commands!
                 user_id = user.id
 
             # Generate questions using RAG pipeline
-            questions = self.rag_pipeline.generate_quiz_questions(document_id=int(document_id), num_questions=5)
+            questions = self.rag_pipeline.generate_quiz_questions(user_id=user_id, document_id=int(document_id), num_questions=5)
 
             if not questions:
                 await query.edit_message_text(
@@ -1772,7 +1782,7 @@ Use /help for available commands!
                     return
 
             # Generate questions using RAG pipeline
-            questions = self.rag_pipeline.generate_quiz_questions(topic=topic, num_questions=5)
+            questions = self.rag_pipeline.generate_quiz_questions(user_id=user_id, topic=topic, num_questions=5)
 
             if not questions:
                 await msg.edit_text(
@@ -1935,49 +1945,6 @@ Use /help for available commands!
         except Exception as e:
             logger.error(f"❌ Error handling quiz answer: {e}")
             await query.edit_message_text("❌ Error processing your answer.")
-
-    async def _handle_quiz_explanation(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
-        """Show explanation for the correct answer"""
-        query = update.callback_query
-        await query.answer()
-
-        try:
-            # Parse callback data: quiz_explain_{quiz_id}
-            quiz_id = int(callback_data.split("_")[2])
-
-            with db_manager.get_session() as session:
-                quiz = session.query(QuizSession).filter(QuizSession.id == quiz_id).first()
-
-                if not quiz:
-                    await query.edit_message_text("❌ Quiz session not found.")
-                    return
-
-                current_idx = quiz.current_question_index
-                question_data = quiz.questions[current_idx]
-                explanation = question_data.get('explanation', 'No explanation available.')
-
-            # Send explanation and ask if they want to continue
-            explanation_text = f"💡 **Explanation:**\n\n{explanation}\n\n"
-            explanation_text += "Would you like to continue with the quiz?"
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Yes, Continue", callback_data=f"quiz_continue_{quiz_id}"),
-                    InlineKeyboardButton("❌ No, End Quiz", callback_data=f"quiz_end_{quiz_id}")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            # Send as new message
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=explanation_text,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-
-        except Exception as e:
-            logger.error(f"❌ Error showing quiz explanation: {e}")
 
     async def _handle_quiz_continue(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
         """Continue to next question or show results"""

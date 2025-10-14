@@ -16,7 +16,7 @@ from config.database import db_manager
 from src.core.rag_pipeline import RAGPipeline
 from src.data.models import Document, Course
 
-def test_rag_pipeline():
+def test_rag_pipeline(user_id: int):
     """Test the RAG pipeline with existing documents"""
     print("🧪 Testing RAG Pipeline...")
     
@@ -32,8 +32,9 @@ def test_rag_pipeline():
         # Test document processing
         print("\n📄 Testing document processing...")
         with db_manager.get_session() as session:
-            # Get first unprocessed document
+            # Get first unprocessed document for this user
             unprocessed_doc = session.query(Document).filter(
+                Document.user_id == user_id,
                 Document.is_processed == False
             ).first()
             
@@ -42,7 +43,7 @@ def test_rag_pipeline():
                 success = rag.process_and_store_document(unprocessed_doc.id)
                 print(f"✅ Processing {'succeeded' if success else 'failed'}")
             else:
-                print("ℹ️ No unprocessed documents found")
+                print("ℹ️ No unprocessed documents found for this user")
         
         # Test retrieval
         print("\n🔍 Testing document retrieval...")
@@ -55,7 +56,7 @@ def test_rag_pipeline():
         
         for query in test_queries:
             print(f"\n❓ Query: {query}")
-            results = rag.retrieve_relevant_chunks(query, top_k=3)
+            results = rag.retrieve_relevant_chunks(query, user_id=user_id, top_k=3)
             
             if results:
                 print(f"Found {len(results)} relevant chunks:")
@@ -68,7 +69,7 @@ def test_rag_pipeline():
         
         # Test context generation
         print("\n🎯 Testing context generation...")
-        context = rag.generate_context("What is a stack data structure?")
+        context = rag.generate_context("What is a stack data structure?", user_id=user_id)
         
         if context['has_relevant_content']:
             print("✅ Context generated successfully")
@@ -86,8 +87,8 @@ def test_rag_pipeline():
         traceback.print_exc()
 
 def create_test_document():
-    """Create a test document for RAG testing"""
-    print("\n📝 Creating test document...")
+    """Create a test document for RAG testing, returning the document ID and user ID."""
+    print("\n📝 Creating test user and document...")
     
     # Create test content
     test_content = """
@@ -129,15 +130,19 @@ def create_test_document():
     
     # Add to database
     with db_manager.get_session() as session:
+        # Get or create a test user
+        test_user = session.query(User).filter(User.telegram_id == "rag_test_user").first()
+        if not test_user:
+            test_user = User(telegram_id="rag_test_user", first_name="RAG Test")
+            session.add(test_user)
+            session.flush()
+
         # Get or create a test course
-        test_course = session.query(Course).filter(Course.course_code == "ICS201").first()
+        test_course = session.query(Course).filter(Course.course_code == "RAG-TEST").first()
         if not test_course:
             test_course = Course(
-                course_code="ICS201",
-                course_name="Data Structures and Algorithms",
-                description="Test course for RAG pipeline",
-                semester="1.2",
-                year=2025,
+                course_code="RAG-TEST",
+                course_name="RAG Test Course",
                 lms_platform="test"
             )
             session.add(test_course)
@@ -145,8 +150,9 @@ def create_test_document():
         
         # Create test document
         test_doc = Document(
+            user_id=test_user.id,
             course_id=test_course.id,
-            title="Week 1 - Data Structures Introduction",
+            title="RAG Test Document - Data Structures",
             file_path=str(test_file_path),
             file_type="txt",
             is_processed=False,
@@ -155,18 +161,18 @@ def create_test_document():
         session.add(test_doc)
         session.commit()
         
-        print(f"✅ Test document added to database with ID: {test_doc.id}")
-        return test_doc.id
+        print(f"✅ Test document ID {test_doc.id} added to database for User ID {test_user.id}")
+        return test_doc.id, test_user.id
 
 if __name__ == "__main__":
     print("🚀 Starting RAG Pipeline Tests")
     print("=" * 50)
     
     # Create test document first
-    test_doc_id = create_test_document()
+    test_doc_id, test_user_id = create_test_document()
     
     # Run RAG tests
-    test_rag_pipeline()
+    test_rag_pipeline(test_user_id)
     
     print("\n" + "=" * 50)
     print("✅ All tests completed!")

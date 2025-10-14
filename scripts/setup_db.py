@@ -65,9 +65,26 @@ def create_sample_data():
             session.add(course)
         session.flush()  # Get course IDs
         
+        # Create a sample user
+        user = User(
+            telegram_id="123456789",
+            username="testuser",
+            first_name="Test",
+            last_name="User",
+            email="test@example.com"
+        )
+        session.add(user)
+        session.flush() # Get user ID
+
+        # Enroll user in courses
+        for course in courses:
+            enrollment = CourseEnrollment(user_id=user.id, course_id=course.id)
+            session.add(enrollment)
+        
         # Create sample documents
         documents = [
             Document(
+                user_id=user.id, # Assign to the new user
                 course_id=courses[0].id,
                 title="Week 1 - Introduction to Data Structures",
                 file_path="./data/mock_lms/courses/ics201/week1_intro.pdf",
@@ -77,6 +94,7 @@ def create_sample_data():
                 processing_status="completed"
             ),
             Document(
+                user_id=user.id, # Assign to the new user
                 course_id=courses[0].id,
                 title="Week 2 - Stacks and Queues",
                 file_path="./data/mock_lms/courses/ics201/week2_stacks_queues.pdf", 
@@ -86,6 +104,7 @@ def create_sample_data():
                 processing_status="completed"
             ),
             Document(
+                user_id=user.id, # Assign to the new user
                 course_id=courses[1].id,
                 title="Software Development Life Cycle",
                 file_path="./data/mock_lms/courses/ics301/sdlc_overview.pdf",

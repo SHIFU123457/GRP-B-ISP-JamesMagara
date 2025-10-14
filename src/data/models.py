@@ -124,6 +124,7 @@ class Document(Base):
     __tablename__ = "documents"
     
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True) # Added for multi-user data isolation
     course_id = Column(Integer, ForeignKey("courses.id"), nullable=False)
     
     # Document details
