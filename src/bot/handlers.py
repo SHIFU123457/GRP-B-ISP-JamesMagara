@@ -1309,20 +1309,32 @@ Choose a setting to modify:
             if potential_titles:
                 logger.info(f"Extracted potential document titles from query: {potential_titles}")
 
-            # Search for matching documents in database
+            # Search for matching documents in database (only those user has access to)
             with db_manager.get_session() as session:
+                from src.data.models import DocumentAccess
+
+                # Get list of document IDs user has access to
+                accessible_doc_ids = [
+                    access.document_id
+                    for access in session.query(DocumentAccess).filter(
+                        DocumentAccess.user_id == user.id,
+                        DocumentAccess.is_active == True
+                    ).all()
+                ]
+
                 for title in potential_titles:
                     # Skip very short titles (likely false positives)
                     if len(title.strip()) < 3:
                         continue
 
-                    # Try exact match first
+                    # Try exact match first - but only from accessible documents
                     doc = session.query(Document).filter(
-                        Document.title.ilike(f"%{title}%")
+                        Document.title.ilike(f"%{title}%"),
+                        Document.id.in_(accessible_doc_ids)  # HYBRID: Check user access
                     ).first()
 
                     if doc:
-                        logger.info(f"✓ Found document '{doc.title}' (ID: {doc.id}, course_id: {doc.course_id})")
+                        logger.info(f"✓ Found accessible document '{doc.title}' (ID: {doc.id}, course_id: {doc.course_id})")
                         return doc.id
 
                 # If we searched but found nothing, store the title for fallback handling

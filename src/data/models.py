@@ -162,6 +162,7 @@ class Document(Base):
     course = relationship("Course", back_populates="documents")
     embeddings = relationship("DocumentEmbedding", back_populates="document")
     user_notifications = relationship("UserNotification", back_populates="document")
+    document_access = relationship("DocumentAccess", back_populates="document")
 
 class UserNotification(Base):
     """Track notifications per user per document for multi-user courses"""
@@ -185,6 +186,36 @@ class UserNotification(Base):
     # Ensure one notification record per user per document
     __table_args__ = (
         UniqueConstraint('user_id', 'document_id', name='uq_user_document_notification'),
+    )
+
+class DocumentAccess(Base):
+    """Track which users can access which documents (access control layer)
+
+    This enables:
+    - One document stored, shared by multiple users
+    - Fine-grained access control per user
+    - Efficient storage (no duplicate files)
+    - Clear audit trail of who has access
+    """
+    __tablename__ = "document_access"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False, index=True)
+
+    # Access metadata
+    granted_at = Column(DateTime(timezone=True), server_default=func.now())
+    access_source = Column(String, default="enrollment")  # enrollment, notification, manual, shared
+    revoked_at = Column(DateTime(timezone=True))  # If access is revoked
+    is_active = Column(Boolean, default=True)
+
+    # Relationships
+    user = relationship("User")
+    document = relationship("Document", back_populates="document_access")
+
+    # Ensure one access record per user-document pair
+    __table_args__ = (
+        UniqueConstraint('user_id', 'document_id', name='uq_user_document_access'),
     )
 
 class DocumentEmbedding(Base):

@@ -13,7 +13,7 @@ import time
 
 from config.settings import settings
 from config.database import db_manager
-from src.data.models import Document, DocumentEmbedding
+from src.data.models import Document, DocumentEmbedding, DocumentAccess
 from src.services.document_processor import DocumentProcessor
 from src.services.llm_integration import LLMService
 
@@ -135,16 +135,15 @@ class RAGPipeline:
                 doc_title = document.title
                 doc_course_id = document.course_id
                 doc_course_code = document.course.course_code if document.course else 'Unknown'
-                doc_user_id = document.user_id # Added for data isolation
 
             # Process document into chunks (outside database session)
+            # NOTE: user_id is NOT stored in metadata anymore - access control via DocumentAccess table
             metadata = {
                 'document_id': document_id,
                 'title': doc_title,
                 'course_id': doc_course_id,
                 'file_type': doc_type,
-                'course_code': doc_course_code,
-                'user_id': doc_user_id # Added for data isolation
+                'course_code': doc_course_code
             }
 
             chunks = self.document_processor.process_document(
@@ -240,11 +239,11 @@ class RAGPipeline:
     
     @retry_with_backoff(max_retries=2, base_delay=0.5)
     def retrieve_relevant_chunks(self, query: str, user_id: int, course_id: Optional[int] = None, document_id: Optional[int] = None, top_k: int = None, min_similarity: Optional[float] = None) -> List[Dict[str, Any]]:
-        """Retrieve most relevant chunks for a given query, filtered by user.
+        """Retrieve most relevant chunks for a given query, filtered by user access.
 
         Args:
             query: Search query text
-            user_id: User ID for filtering
+            user_id: User ID for access control filtering
             course_id: Optional course filter
             document_id: Optional document filter
             top_k: Number of results to retrieve
@@ -265,17 +264,42 @@ class RAGPipeline:
             logger.info(f"Query embedding shape: {len(query_embedding)}")
             logger.info(f"Query embedding sample: {query_embedding[:5]}")  # First 5 values
 
+            # Get list of document IDs user has access to via DocumentAccess table
+            with db_manager.get_session() as session:
+                accessible_doc_ids = [
+                    access.document_id
+                    for access in session.query(DocumentAccess).filter(
+                        DocumentAccess.user_id == user_id,
+                        DocumentAccess.is_active == True
+                    ).all()
+                ]
+
+            if not accessible_doc_ids:
+                logger.warning(f"User {user_id} has no accessible documents")
+                return []
+
+            logger.info(f"User {user_id} has access to {len(accessible_doc_ids)} documents")
+
             # Prepare filter for document/course-specific search
-            # User ID is now mandatory for data isolation
-            filter_conditions = [{"user_id": user_id}]
-            logger.info(f"Filtering by user_id: {user_id}")
+            filter_conditions = []
 
             if document_id:
+                # Verify user has access to this specific document
+                if document_id not in accessible_doc_ids:
+                    logger.warning(f"User {user_id} does not have access to document {document_id}")
+                    return []
                 filter_conditions.append({"document_id": document_id})
                 logger.info(f"Filtering by document_id: {document_id} (min_similarity: {min_similarity})")
-            elif course_id:
+            else:
+                # Filter by ALL accessible documents
+                # ChromaDB uses $in operator for list filtering
+                filter_conditions.append({"document_id": {"$in": accessible_doc_ids}})
+                logger.info(f"Filtering by {len(accessible_doc_ids)} accessible documents")
+
+            if course_id:
+                # Additional course filter if specified
                 filter_conditions.append({"course_id": course_id})
-                logger.info(f"Filtering by course_id: {course_id}")
+                logger.info(f"Additional filter by course_id: {course_id}")
 
             # Combine conditions using $and if there are multiple, otherwise use the single condition.
             where_filter = {"$and": filter_conditions} if len(filter_conditions) > 1 else filter_conditions[0]

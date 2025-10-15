@@ -14,7 +14,7 @@ sys.path.insert(0, str(project_root))
 
 from config.database import db_manager
 from src.core.rag_pipeline import RAGPipeline
-from src.data.models import Document, Course
+from src.data.models import Document, Course, User, DocumentAccess
 
 def test_rag_pipeline(user_id: int):
     """Test the RAG pipeline with existing documents"""
@@ -32,12 +32,23 @@ def test_rag_pipeline(user_id: int):
         # Test document processing
         print("\n📄 Testing document processing...")
         with db_manager.get_session() as session:
-            # Get first unprocessed document for this user
+            from src.data.models import DocumentAccess
+
+            # Get document IDs user has access to
+            accessible_doc_ids = [
+                access.document_id
+                for access in session.query(DocumentAccess).filter(
+                    DocumentAccess.user_id == user_id,
+                    DocumentAccess.is_active == True
+                ).all()
+            ]
+
+            # Get first unprocessed document that user has access to
             unprocessed_doc = session.query(Document).filter(
-                Document.user_id == user_id,
+                Document.id.in_(accessible_doc_ids),
                 Document.is_processed == False
             ).first()
-            
+
             if unprocessed_doc:
                 print(f"Processing document: {unprocessed_doc.title}")
                 success = rag.process_and_store_document(unprocessed_doc.id)
@@ -147,21 +158,50 @@ def create_test_document():
             )
             session.add(test_course)
             session.flush()
-        
-        # Create test document
-        test_doc = Document(
-            user_id=test_user.id,
-            course_id=test_course.id,
-            title="RAG Test Document - Data Structures",
-            file_path=str(test_file_path),
-            file_type="txt",
-            is_processed=False,
-            processing_status="pending"
-        )
-        session.add(test_doc)
+
+        # HYBRID ARCHITECTURE: Check if document already exists at COURSE level
+        test_doc = session.query(Document).filter(
+            Document.title == "RAG Test Document - Data Structures",
+            Document.course_id == test_course.id
+        ).first()
+
+        if not test_doc:
+            # Create test document WITHOUT user_id (shared at course level)
+            test_doc = Document(
+                course_id=test_course.id,
+                title="RAG Test Document - Data Structures",
+                file_path=str(test_file_path),
+                file_type="txt",
+                is_processed=False,
+                processing_status="pending"
+            )
+            session.add(test_doc)
+            session.flush()
+            print(f"✅ Created new test document ID {test_doc.id}")
+        else:
+            print(f"✅ Found existing test document ID {test_doc.id}")
+
+        # HYBRID ARCHITECTURE: Grant access to this user via DocumentAccess
+        existing_access = session.query(DocumentAccess).filter(
+            DocumentAccess.user_id == test_user.id,
+            DocumentAccess.document_id == test_doc.id
+        ).first()
+
+        if not existing_access:
+            doc_access = DocumentAccess(
+                user_id=test_user.id,
+                document_id=test_doc.id,
+                access_source="test",
+                is_active=True
+            )
+            session.add(doc_access)
+            print(f"✅ Granted access to user {test_user.id} for document {test_doc.id}")
+        else:
+            print(f"✅ User {test_user.id} already has access to document {test_doc.id}")
+
         session.commit()
-        
-        print(f"✅ Test document ID {test_doc.id} added to database for User ID {test_user.id}")
+
+        print(f"✅ Test setup complete: Document ID {test_doc.id}, User ID {test_user.id}")
         return test_doc.id, test_user.id
 
 if __name__ == "__main__":
