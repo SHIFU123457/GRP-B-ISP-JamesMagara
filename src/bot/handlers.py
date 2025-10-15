@@ -1129,7 +1129,8 @@ Choose a setting to modify:
 
             # Create context-aware queries based on the action type
             if action == "complete_assignment":
-                query = f"Help me complete the assignment '{doc_title}'. Provide step-by-step guidance based on the requirements and suggest approaches to answer each part."
+                # Special handling for assignments - extract and answer all questions
+                return await self._complete_assignment_with_questions(doc_id, doc_title, user_id, material_type)
             elif action == "breakdown_assignment":
                 query = f"Break down the assignment '{doc_title}' into smaller, manageable tasks. What steps should I follow?"
             elif action == "explain_assignment":
@@ -1211,6 +1212,129 @@ Choose a setting to modify:
             logger.error(f"❌ Error generating material response: {e}")
             return "❌ Sorry, I encountered an error while analyzing the material. Please try asking your question directly in a message."
 
+
+    async def _complete_assignment_with_questions(self, doc_id: int, doc_title: str, user_id: int, material_type: str) -> str:
+        """
+        Extract and answer all questions from an exam/assignment document.
+
+        This implements Option 3 (Best approach) for handling multi-question documents:
+        1. Retrieve ALL chunks from the document (sorted chronologically)
+        2. Extract questions using regex patterns
+        3. Answer each question individually using RAG
+        4. Format responses chronologically
+        """
+        import re
+
+        try:
+            logger.info(f"Starting comprehensive assignment answering for document {doc_id}")
+
+            # Step 1: Retrieve ALL chunks from document in chronological order
+            all_chunks = self.rag_pipeline.retrieve_relevant_chunks(
+                query="",  # Empty query - we want all chunks
+                user_id=user_id,
+                document_id=doc_id,
+                top_k=100,  # Get many chunks
+                min_similarity=0.0  # Accept ALL chunks from document
+            )
+
+            if not all_chunks:
+                return "❌ Could not retrieve document content. Please try again."
+
+            # Step 2: Sort chunks by chunk_index to preserve document order
+            all_chunks.sort(key=lambda x: x['metadata'].get('chunk_index', 0))
+            logger.info(f"Retrieved {len(all_chunks)} chunks from document")
+
+            # Step 3: Build full document text
+            full_text = "\n\n".join([chunk['text'] for chunk in all_chunks])
+            logger.info(f"Built full document text ({len(full_text)} characters)")
+
+            # Step 4: Extract questions using comprehensive regex patterns
+            question_patterns = [
+                # "Question ONE", "Question 1", "Q1:", "Q.1"
+                r'(?:Question|Q)\.?\s*(\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|COMPULSORY)[:\.\s]+([^?]+\?(?:[^\n]*\n)*?)(?=(?:Question|Q)\.?\s*(?:\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)|$)',
+                # Fallback: standalone questions ending with "?"
+                r'(\d+)\.\s*([^?]+\?)',
+            ]
+
+            questions = []
+            for pattern in question_patterns:
+                matches = re.findall(pattern, full_text, re.DOTALL | re.IGNORECASE)
+                if matches:
+                    questions.extend(matches)
+                    break  # Use first successful pattern
+
+            if not questions:
+                # Fallback: treat entire document as single question
+                logger.warning("No questions detected with regex, treating as single question")
+                return await self._answer_single_question(
+                    full_text[:2000],  # Limit to first 2000 chars
+                    doc_title,
+                    user_id,
+                    material_type
+                )
+
+            logger.info(f"Extracted {len(questions)} questions from document")
+
+            # Step 5: Answer each question individually
+            responses = []
+            responses.append(f"📝 **Assignment: {doc_title}**\n")
+            responses.append(f"I'll answer all questions based on the course materials.\n")
+            responses.append("="*50 + "\n")
+
+            for i, (q_num, q_text) in enumerate(questions, 1):
+                logger.info(f"Answering question {i}/{len(questions)}: {q_num}")
+
+                # Clean question text
+                q_text = q_text.strip()
+
+                # Get relevant context for THIS specific question
+                # Use higher top_k to get comprehensive context
+                question_context = self.rag_pipeline.generate_rag_response(
+                    query=f"Answer this exam question comprehensively using course materials:\n\n{q_text[:800]}",
+                    user_id=user_id,
+                    document_id=None,  # Search all accessible documents
+                    top_k=20  # Get more context per question
+                )
+
+                # Format the response for this question
+                responses.append(f"\n**Question {q_num}**\n")
+                responses.append(f"{q_text}\n")
+                responses.append(f"\n**Answer:**\n")
+                responses.append(f"{question_context['response']}\n")
+                responses.append("\n" + "-"*50 + "\n")
+
+            # Step 6: Combine all responses
+            final_response = "\n".join(responses)
+
+            logger.info(f"Successfully answered {len(questions)} questions ({len(final_response)} chars)")
+
+            return final_response
+
+        except Exception as e:
+            logger.error(f"Error in _complete_assignment_with_questions: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to basic approach
+            return f"❌ Error processing assignment questions: {e}\n\nPlease try asking about specific questions individually."
+
+
+    async def _answer_single_question(self, question_text: str, doc_title: str, user_id: int, material_type: str) -> str:
+        """Fallback for when no questions are detected - treat entire document as one question."""
+        try:
+            # Load user
+            with db_manager.get_session() as session:
+                user = session.query(User).filter(User.id == user_id).first()
+                if not user:
+                    return "❌ User not found"
+
+                # Generate response
+                query = f"Help me complete this assignment/exam:\n\n{question_text}"
+                response = await self._process_query_rag_enhanced(query, user)
+
+                return f"📝 **{doc_title}**\n\n{response}"
+        except Exception as e:
+            logger.error(f"Error in _answer_single_question: {e}")
+            return f"❌ Error: {e}"
 
 
     async def _process_query_rag_enhanced(self, query: str, user: User, document_id: Optional[int] = None) -> str:
