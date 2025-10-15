@@ -1288,12 +1288,11 @@ Choose a setting to modify:
                 q_text = q_text.strip()
 
                 # Get relevant context for THIS specific question
-                # Use higher top_k to get comprehensive context
+                # Note: generate_rag_response uses TOP_K_RETRIEVAL from settings
                 question_context = self.rag_pipeline.generate_rag_response(
                     query=f"Answer this exam question comprehensively using course materials:\n\n{q_text[:800]}",
                     user_id=user_id,
-                    document_id=None,  # Search all accessible documents
-                    top_k=20  # Get more context per question
+                    document_id=None  # Search all accessible documents
                 )
 
                 # Format the response for this question
