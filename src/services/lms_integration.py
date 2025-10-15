@@ -18,7 +18,7 @@ from googleapiclient.errors import HttpError
 from config.settings import settings
 from src.services.oauth_manager import UserOAuthManager, UserGoogleClassroomConnector, oauth_manager as shared_oauth_manager
 from config.database import db_manager
-from src.data.models import Course, Document
+from src.data.models import Course, Document, DocumentAccess, UserNotification
 from src.services.document_processor import DocumentProcessor
 
 logger = logging.getLogger(__name__)
@@ -635,6 +635,27 @@ class LMSIntegrationService:
 
         return stats
 
+    def _grant_document_access(self, session, user_id: int, document_id: int, access_source: str = 'notification') -> DocumentAccess:
+        """Grant a user access to a document (creates DocumentAccess record if not exists)"""
+        existing_access = session.query(DocumentAccess).filter(
+            DocumentAccess.user_id == user_id,
+            DocumentAccess.document_id == document_id
+        ).first()
+
+        if not existing_access:
+            access = DocumentAccess(
+                user_id=user_id,
+                document_id=document_id,
+                access_source=access_source,
+                granted_at=datetime.now()
+            )
+            session.add(access)
+            logger.debug(f"Granted access to user {user_id} for document {document_id}")
+            return access
+        else:
+            logger.debug(f"User {user_id} already has access to document {document_id}")
+            return existing_access
+
     def _sync_google_classroom_materials(self, connector: UserGoogleClassroomConnector,
                                        course: Course, session, include_unnotified: bool = True) -> List[Document]:
         """
@@ -735,14 +756,15 @@ class LMSIntegrationService:
                         file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
 
                         if file_ext in settings.SUPPORTED_FILE_TYPES:
-                            # Check if document already exists
+                            # HYBRID ARCHITECTURE: Check if document exists at COURSE level (shared across users)
                             existing_doc = session.query(Document).filter(
                                 Document.lms_document_id == drive_file['id'],
                                 Document.course_id == course.id
+                                # NO user_id check - documents are shared!
                             ).first()
 
                             if not existing_doc:
-                                # Download new document
+                                # Download new document (shared by all users in this course)
                                 try:
                                     local_path = self._download_google_drive_file(
                                         connector, drive_file, course, filename
@@ -750,6 +772,7 @@ class LMSIntegrationService:
 
                                     if local_path:
                                         new_document = Document(
+                                            # NO user_id - documents are course-level!
                                             course_id=course.id,
                                             title=filename,
                                             file_path=local_path,
@@ -766,23 +789,33 @@ class LMSIntegrationService:
                                         )
                                         session.add(new_document)
                                         session.flush()
+
+                                        # Grant access to THIS user
+                                        self._grant_document_access(session, user_id, new_document.id, 'notification')
+
                                         synced_documents.append(new_document)
-                                        logger.info(f"Added new document: {filename}")
+                                        logger.info(f"Added new shared document: {filename}")
 
                                 except Exception as e:
                                     logger.error(f"Failed to download document {filename}: {e}")
                                     continue
-                            elif include_unnotified:
-                                # Gmail-triggered sync: check if this user has been notified for this document
-                                user_notification = session.query(UserNotification).filter(
-                                    UserNotification.user_id == user_id,
-                                    UserNotification.document_id == existing_doc.id
-                                ).first()
+                            else:
+                                # Document exists - grant access to THIS user if not already granted
+                                self._grant_document_access(session, user_id, existing_doc.id, 'notification')
 
-                                if not user_notification or not user_notification.notification_sent:
-                                    # User hasn't been notified yet - re-queue the document
-                                    synced_documents.append(existing_doc)
-                                    logger.info(f"Re-queuing existing un-notified document for user {user_id}: {filename}")
+                                if include_unnotified:
+                                    # Gmail-triggered sync: check if this user has been notified for this document
+                                    user_notification = session.query(UserNotification).filter(
+                                        UserNotification.user_id == user_id,
+                                        UserNotification.document_id == existing_doc.id
+                                    ).first()
+
+                                    if not user_notification or not user_notification.notification_sent:
+                                        # User hasn't been notified yet - re-queue the document
+                                        synced_documents.append(existing_doc)
+                                        logger.info(f"Re-queuing existing un-notified document for user {user_id}: {filename}")
+                                else:
+                                    logger.info(f"Granted access to existing document for user {user_id}: {filename}")
                         else:
                             logger.debug(f"Skipping unsupported file type '{file_ext}': {filename}")
 
@@ -865,14 +898,14 @@ class LMSIntegrationService:
                             file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
 
                             if file_ext in settings.SUPPORTED_FILE_TYPES:
-                                # Check if document already exists
+                                # HYBRID ARCHITECTURE: Check at COURSE level (shared)
                                 existing_doc = session.query(Document).filter(
                                     Document.lms_document_id == drive_file['id'],
                                     Document.course_id == course.id
                                 ).first()
 
                                 if not existing_doc:
-                                    # Download new document
+                                    # Download new shared document
                                     try:
                                         local_path = self._download_google_drive_file(
                                             connector, drive_file, course, filename
@@ -880,6 +913,7 @@ class LMSIntegrationService:
 
                                         if local_path:
                                             new_document = Document(
+                                                # NO user_id - shared!
                                                 course_id=course.id,
                                                 title=filename,
                                                 file_path=local_path,
@@ -889,27 +923,37 @@ class LMSIntegrationService:
                                                 lms_last_modified=datetime.now(),
                                                 is_processed=False,
                                                 processing_status="pending",
-                                                material_type='announcement'  # Mark as announcement
+                                                material_type='announcement'
                                             )
                                             session.add(new_document)
                                             session.flush()
+
+                                            # Grant access to THIS user
+                                            self._grant_document_access(session, user_id, new_document.id, 'notification')
+
                                             synced_documents.append(new_document)
-                                            logger.info(f"Added new announcement document: {filename}")
+                                            logger.info(f"Added new shared announcement document: {filename}")
 
                                     except Exception as e:
                                         logger.error(f"Failed to download announcement document {filename}: {e}")
                                         continue
-                                elif include_unnotified:
-                                    # Gmail-triggered sync: check if this user has been notified
-                                    user_notification = session.query(UserNotification).filter(
-                                        UserNotification.user_id == user_id,
-                                        UserNotification.document_id == existing_doc.id
-                                    ).first()
+                                else:
+                                    # Document exists - grant access to THIS user
+                                    self._grant_document_access(session, user_id, existing_doc.id, 'notification')
 
-                                    if not user_notification or not user_notification.notification_sent:
-                                        # User hasn't been notified yet - re-queue
-                                        synced_documents.append(existing_doc)
-                                        logger.info(f"Re-queuing existing un-notified announcement for user {user_id}: {filename}")
+                                    if include_unnotified:
+                                        # Gmail-triggered sync: check if this user has been notified
+                                        user_notification = session.query(UserNotification).filter(
+                                            UserNotification.user_id == user_id,
+                                            UserNotification.document_id == existing_doc.id
+                                        ).first()
+
+                                        if not user_notification or not user_notification.notification_sent:
+                                            # User hasn't been notified yet - re-queue
+                                            synced_documents.append(existing_doc)
+                                            logger.info(f"Re-queuing existing un-notified announcement for user {user_id}: {filename}")
+                                    else:
+                                        logger.info(f"Granted access to existing announcement for user {user_id}: {filename}")
 
             except Exception as announce_error:
                 logger.error(f"Error syncing announcements for course {course.course_name}: {announce_error}")
@@ -945,14 +989,14 @@ class LMSIntegrationService:
                             file_ext = filename.split('.')[-1].lower() if '.' in filename else ''
 
                             if file_ext in settings.SUPPORTED_FILE_TYPES:
-                                # Check if document already exists
+                                # HYBRID ARCHITECTURE: Check at COURSE level (shared)
                                 existing_doc = session.query(Document).filter(
                                     Document.lms_document_id == drive_file['id'],
                                     Document.course_id == course.id
                                 ).first()
 
                                 if not existing_doc:
-                                    # Download new document
+                                    # Download new shared document
                                     try:
                                         local_path = self._download_google_drive_file(
                                             connector, drive_file, course, filename
@@ -960,6 +1004,7 @@ class LMSIntegrationService:
 
                                         if local_path:
                                             new_document = Document(
+                                                # NO user_id - shared!
                                                 course_id=course.id,
                                                 title=filename,
                                                 file_path=local_path,
@@ -969,27 +1014,37 @@ class LMSIntegrationService:
                                                 lms_last_modified=datetime.now(),
                                                 is_processed=False,
                                                 processing_status="pending",
-                                                material_type='material'  # Materials are always type 'material'
+                                                material_type='material'
                                             )
                                             session.add(new_document)
                                             session.flush()
+
+                                            # Grant access to THIS user
+                                            self._grant_document_access(session, user_id, new_document.id, 'notification')
+
                                             synced_documents.append(new_document)
-                                            logger.info(f"Added new course material: {filename}")
+                                            logger.info(f"Added new shared course material: {filename}")
 
                                     except Exception as e:
                                         logger.error(f"Failed to download course material {filename}: {e}")
                                         continue
-                                elif include_unnotified:
-                                    # Gmail-triggered sync: check if this user has been notified
-                                    user_notification = session.query(UserNotification).filter(
-                                        UserNotification.user_id == user_id,
-                                        UserNotification.document_id == existing_doc.id
-                                    ).first()
+                                else:
+                                    # Document exists - grant access to THIS user
+                                    self._grant_document_access(session, user_id, existing_doc.id, 'notification')
 
-                                    if not user_notification or not user_notification.notification_sent:
-                                        # User hasn't been notified yet - re-queue
-                                        synced_documents.append(existing_doc)
-                                        logger.info(f"Re-queuing existing un-notified course material for user {user_id}: {filename}")
+                                    if include_unnotified:
+                                        # Gmail-triggered sync: check if this user has been notified
+                                        user_notification = session.query(UserNotification).filter(
+                                            UserNotification.user_id == user_id,
+                                            UserNotification.document_id == existing_doc.id
+                                        ).first()
+
+                                        if not user_notification or not user_notification.notification_sent:
+                                            # User hasn't been notified yet - re-queue
+                                            synced_documents.append(existing_doc)
+                                            logger.info(f"Re-queuing existing un-notified course material for user {user_id}: {filename}")
+                                    else:
+                                        logger.info(f"Granted access to existing course material for user {user_id}: {filename}")
                             else:
                                 logger.debug(f"Skipping unsupported file type '{file_ext}' in course material: {filename}")
 

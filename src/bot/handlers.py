@@ -14,7 +14,7 @@ from telegram.ext import (
 )
 from sqlalchemy.orm import Session
 
-from src.data.models import User, UserInteraction, PersonalizationProfile
+from src.data.models import User, UserInteraction, PersonalizationProfile, QuizSession
 from config.database import db_manager
 from config.settings import settings
 #For RAG functionality
@@ -751,17 +751,88 @@ Choose a setting to modify:
         """Handle general text queries - main AI interaction - with enhanced RAG"""
         user_data = update.effective_user
         query_text = update.message.text
-        
+
         try:
             # Show typing indicator
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-            
+
+            # Cache user_id and active_quiz_id within session scope
             with db_manager.get_session() as session:
                 user = self._get_or_create_user(session, user_data)
-                
+                user_id = user.id
+
+                # Check if user has an active quiz session
+                active_quiz = session.query(QuizSession).filter(
+                    QuizSession.user_id == user_id,
+                    QuizSession.is_active == True
+                ).first()
+
+                # Cache quiz ID before session closes
+                active_quiz_id = active_quiz.id if active_quiz else None
+
+            # Detect quiz-related commands
+            query_lower = query_text.lower()
+            quiz_keywords = [
+                'quiz me', 'ask me questions', 'test me', 'generate questions',
+                'quiz on', 'questions on', 'questions about', 'test my knowledge',
+                'question me on', 'question me about', 'question me regarding',
+                'provide a quiz', 'provide quiz', 'format a quiz', 'formate a quiz',
+                'create a quiz', 'create quiz', 'give me a quiz', 'make a quiz',
+                'another quiz', 'new quiz', 'start a quiz', 'begin a quiz'
+            ]
+
+            is_quiz_request = any(keyword in query_lower for keyword in quiz_keywords)
+
+            # If active quiz exists and user types something unrelated
+            if active_quiz_id and not is_quiz_request:
+                # Pause the quiz and answer the question
+                with db_manager.get_session() as session:
+                    quiz = session.query(QuizSession).filter(QuizSession.id == active_quiz_id).first()
+                    quiz.is_paused = True
+                    session.commit()
+
+                # Answer the question
+                with db_manager.get_session() as session:
+                    user = session.query(User).filter(User.id == user_id).first()
+                    response_text = await self._process_query_rag_enhanced(query_text, user)
+
+                await update.message.reply_text(response_text)
+
+                # Ask if they want to continue the quiz
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Resume Quiz", callback_data=f"quiz_resume_{active_quiz_id}"),
+                        InlineKeyboardButton("❌ End Quiz", callback_data=f"quiz_end_{active_quiz_id}")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await update.message.reply_text(
+                    "Would you like to continue with your quiz?",
+                    reply_markup=reply_markup
+                )
+                return
+
+            # Handle quiz initiation requests
+            if is_quiz_request:
+                # Extract topic from query
+                topic = self._extract_quiz_topic(query_text)
+                if topic:
+                    await self._initiate_quiz_from_topic(update.effective_chat.id, user_id, topic)
+                else:
+                    await update.message.reply_text(
+                        "Please specify a topic you'd like to be quizzed on.\n"
+                        "For example: 'Quiz me on data structures' or 'Ask me questions about Python'"
+                    )
+                return
+
+            # Regular query processing
+            with db_manager.get_session() as session:
+                user = session.query(User).filter(User.id == user_id).first()
+
                 # Use the enhanced RAG processing
                 response_text = await self._process_query_rag_enhanced(query_text, user)
-                
+
                 # Send response (split if too long for Telegram)
                 # Temporarily disable Markdown to fix parsing errors
                 if len(response_text) > 4096:  # Telegram message limit
@@ -773,7 +844,7 @@ Choose a setting to modify:
                             await asyncio.sleep(0.5)
                 else:
                     await update.message.reply_text(response_text)  # No parse_mode
-                
+
                 # Create feedback buttons
                 keyboard = [
                     [
@@ -782,15 +853,15 @@ Choose a setting to modify:
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
-                
+
                 await update.message.reply_text(
-                    "Was this response helpful?", 
+                    "Was this response helpful?",
                     reply_markup=reply_markup
                 )
-                
+
                 # Log interaction with enhanced metadata
                 self._log_rag_interaction(session, user.id, query_text, response_text)
-                
+
         except Exception as e:
             logger.error(f"Error in handle_query: {e}")
             await update.message.reply_text(
@@ -956,9 +1027,22 @@ Choose a setting to modify:
                                           "summarize_material_", "questions_material_", "keypoints_material_")):
                 await self._handle_material_assistance(update, context, callback_data)
 
+            # Handle quiz-related callbacks
+            elif callback_data.startswith("quiz_answer_"):
+                await self._handle_quiz_answer(update, context, callback_data)
+
+            elif callback_data.startswith("quiz_continue_"):
+                await self._handle_quiz_continue(update, context, callback_data)
+
+            elif callback_data.startswith("quiz_resume_"):
+                await self._handle_quiz_resume(update, context, callback_data)
+
+            elif callback_data.startswith("quiz_end_"):
+                await self._handle_quiz_end(update, context, callback_data)
+
             else:
                 await query.edit_message_text("Feature coming soon! Though sifai kujibu hivi mkuu. \n\n Kwa handle_callback")
-                
+
         except Exception as e:
             logger.error(f"Error in handle_callback: {e}")
             await query.edit_message_text("Sorry, something went wrong. Please try again. \n\n Kwa handle_callback superior")
@@ -977,6 +1061,11 @@ Choose a setting to modify:
 
             action = "_".join(parts[:-1])  # e.g., "help_assignment", "summarize_reading"
             document_id = parts[-1]
+
+            # Handle quiz initiation separately
+            if action == "questions_material":
+                await self._initiate_quiz_from_document(update, context, document_id)
+                return
 
             # Get document details (cache values before session closes)
             with db_manager.get_session() as session:
@@ -1141,18 +1230,18 @@ Choose a setting to modify:
                     delattr(self, '_last_searched_doc_title')
 
             # Determine course context from query
-            # Priority: document_id > no filter (search all)
-            # Course filtering disabled because many enrolled courses have no documents
-            course_id = None
+            course_id = self._extract_course_context(query, user)
             if not document_id:
                 # If user explicitly mentioned a document that wasn't found,
                 # don't filter by course - search all documents for related content
                 if searched_doc_title:
-                    logger.info(f"Document '{searched_doc_title}' not found - searching ALL documents without course filter")
+                    logger.info(f"Document '{searched_doc_title}' not found - searching ALL user documents without course filter")
+                    course_id = None # Override course context to search all
                 else:
-                    # Always search all documents - don't restrict by course
-                    # This ensures we find relevant content even if user's active course is empty
-                    logger.info(f"No specific document - searching ALL documents (course filter disabled for better coverage)")
+                    if course_id:
+                        logger.info(f"Course context found: {course_id}. Searching within this course.")
+                    else:
+                        logger.info(f"No specific document or course - searching ALL documents for user {user.id}")
 
             # Get user preferences for personalization
             user_preferences = {
@@ -1164,6 +1253,7 @@ Choose a setting to modify:
             # Generate RAG response using the enhanced pipeline
             rag_result = self.rag_pipeline.generate_rag_response(
                 query,
+                user_id=user.id, # Pass user_id for data isolation
                 course_id=course_id,
                 document_id=document_id,
                 user_preferences=user_preferences
@@ -1219,20 +1309,32 @@ Choose a setting to modify:
             if potential_titles:
                 logger.info(f"Extracted potential document titles from query: {potential_titles}")
 
-            # Search for matching documents in database
+            # Search for matching documents in database (only those user has access to)
             with db_manager.get_session() as session:
+                from src.data.models import DocumentAccess
+
+                # Get list of document IDs user has access to
+                accessible_doc_ids = [
+                    access.document_id
+                    for access in session.query(DocumentAccess).filter(
+                        DocumentAccess.user_id == user.id,
+                        DocumentAccess.is_active == True
+                    ).all()
+                ]
+
                 for title in potential_titles:
                     # Skip very short titles (likely false positives)
                     if len(title.strip()) < 3:
                         continue
 
-                    # Try exact match first
+                    # Try exact match first - but only from accessible documents
                     doc = session.query(Document).filter(
-                        Document.title.ilike(f"%{title}%")
+                        Document.title.ilike(f"%{title}%"),
+                        Document.id.in_(accessible_doc_ids)  # HYBRID: Check user access
                     ).first()
 
                     if doc:
-                        logger.info(f"✓ Found document '{doc.title}' (ID: {doc.id}, course_id: {doc.course_id})")
+                        logger.info(f"✓ Found accessible document '{doc.title}' (ID: {doc.id}, course_id: {doc.course_id})")
                         return doc.id
 
                 # If we searched but found nothing, store the title for fallback handling
@@ -1275,20 +1377,7 @@ Choose a setting to modify:
                     if course:
                         return course.id
         
-        # If no explicit course found, try to get user's most active course
-        try:
-            with db_manager.get_session() as session:
-                # Get user's most recent course enrollment
-                recent_enrollment = session.query(CourseEnrollment).filter(
-                    CourseEnrollment.user_id == user.id,
-                    CourseEnrollment.is_active == True
-                ).order_by(CourseEnrollment.enrollment_date.desc()).first()
-                
-                if recent_enrollment:
-                    return recent_enrollment.course_id
-        except Exception as e:
-            logger.warning(f"Could not determine user's active course: {e}")
-        
+        # If no explicit course found, return None. The automatic fallback has been removed.
         return None
 
     async def _generate_rag_response(self, query: str, rag_context: Dict[str, Any], user: User) -> str:
@@ -1559,18 +1648,520 @@ Use /help for available commands!
             response_time_ms=0  # Will be calculated properly later
         )
         session.add(interaction)
-        
+
         # Update personalization profile
         profile = session.query(PersonalizationProfile).filter(
             PersonalizationProfile.user_id == user_id
         ).first()
-        
+
         if profile:
             profile.total_interactions += 1
             profile.last_interaction = datetime.now()
-        
+
         session.commit()
-    
+
+    # ============= QUIZ FUNCTIONALITY =============
+
+    def _extract_quiz_topic(self, query_text: str) -> Optional[str]:
+        """Extract topic from quiz request query"""
+        import re
+
+        query_lower = query_text.lower()
+
+        # Patterns to extract topic - ordered from most specific to least specific
+        patterns = [
+            # "quiz me on/about X"
+            r'quiz me (?:on|about|regarding)\s+(.+)',
+            # "ask me questions on/about X"
+            r'ask me questions (?:on|about|regarding)\s+(.+)',
+            # "test me on/about X"
+            r'test me (?:on|about|regarding)\s+(.+)',
+            # "generate questions on/about X"
+            r'generate questions (?:on|about|regarding)\s+(.+)',
+            # "question me on/about X"
+            r'question me (?:on|about|regarding)\s+(.+)',
+            # "provide a quiz on/about X"
+            r'provide (?:a )?quiz (?:on|about|regarding)\s+(.+)',
+            # "format/formate a quiz on X"
+            r'forma?te? (?:a |another )?quiz (?:on|about|regarding)\s+(.+)',
+            # "create a quiz on X"
+            r'create (?:a |another )?quiz (?:on|about|regarding)\s+(.+)',
+            # "give me a quiz on X"
+            r'give me (?:a )?quiz (?:on|about|regarding)\s+(.+)',
+            # "another quiz on X" or "new quiz on X"
+            r'(?:another|new) quiz (?:on|about|regarding)\s+(.+)',
+            # "start a quiz on X"
+            r'(?:start|begin) (?:a )?quiz (?:on|about|regarding)\s+(.+)',
+            # Fallback: "quiz on X" (no "me")
+            r'quiz (?:on|about|regarding)\s+(.+)',
+            # Fallback: "questions on X"
+            r'questions (?:on|about|regarding)\s+(.+)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                topic = match.group(1).strip()
+                # Remove trailing punctuation
+                topic = topic.rstrip('.,!?')
+                return topic
+
+        return None
+
+    async def _initiate_quiz_from_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document_id: str):
+        """Initiate a quiz session from a document"""
+        query = update.callback_query
+        user_data = query.from_user
+
+        try:
+            await query.edit_message_text("🧠 Generating quiz questions from the material... Please wait.")
+
+            # Get user
+            with db_manager.get_session() as session:
+                user = session.query(User).filter(User.telegram_id == str(user_data.id)).first()
+                if not user:
+                    await query.edit_message_text("❌ Please use /start first.")
+                    return
+
+                # Check if user already has an active quiz
+                active_quiz = session.query(QuizSession).filter(
+                    QuizSession.user_id == user.id,
+                    QuizSession.is_active == True
+                ).first()
+
+                if active_quiz:
+                    await query.edit_message_text(
+                        "⚠️ You already have an active quiz session. Please complete it first or type /cancel_quiz to cancel it."
+                    )
+                    return
+
+                user_id = user.id
+
+            # Generate questions using RAG pipeline
+            questions = self.rag_pipeline.generate_quiz_questions(user_id=user_id, document_id=int(document_id), num_questions=5)
+
+            if not questions:
+                await query.edit_message_text(
+                    "❌ Sorry, I couldn't generate questions from this material. The content might not be suitable for quiz generation."
+                )
+                return
+
+            # Create quiz session
+            with db_manager.get_session() as session:
+                quiz_session = QuizSession(
+                    user_id=user_id,
+                    document_id=int(document_id),
+                    questions=questions,
+                    current_question_index=0,
+                    total_questions=len(questions),
+                    is_active=True,
+                    is_paused=False
+                )
+                session.add(quiz_session)
+                session.commit()
+                quiz_id = quiz_session.id
+
+            # Send the first question
+            await self._send_quiz_question(context, query.message.chat_id, quiz_id)
+            await query.message.delete()  # Delete the "generating..." message
+
+            logger.info(f"✅ Started quiz session {quiz_id} for user {user_data.id} from document {document_id}")
+
+        except Exception as e:
+            logger.error(f"❌ Error initiating quiz from document: {e}")
+            await query.edit_message_text("❌ Sorry, failed to start the quiz. Please try again.")
+
+    async def _initiate_quiz_from_topic(self, chat_id: int, user_id: int, topic: str):
+        """Initiate a quiz session from a topic search"""
+        try:
+            # Send initial message
+            msg = await self.application.bot.send_message(
+                chat_id=chat_id,
+                text=f"🧠 Generating quiz questions about '{topic}'... Please wait."
+            )
+
+            # Check if user already has an active quiz
+            with db_manager.get_session() as session:
+                active_quiz = session.query(QuizSession).filter(
+                    QuizSession.user_id == user_id,
+                    QuizSession.is_active == True
+                ).first()
+
+                if active_quiz:
+                    await msg.edit_text(
+                        "⚠️ You already have an active quiz session. Please complete it first or type /cancel_quiz to cancel it."
+                    )
+                    return
+
+            # Generate questions using RAG pipeline
+            questions = self.rag_pipeline.generate_quiz_questions(user_id=user_id, topic=topic, num_questions=5)
+
+            if not questions:
+                await msg.edit_text(
+                    f"❌ Sorry, I couldn't find enough material about '{topic}' to generate quiz questions."
+                )
+                return
+
+            # Create quiz session
+            with db_manager.get_session() as session:
+                quiz_session = QuizSession(
+                    user_id=user_id,
+                    topic=topic,
+                    questions=questions,
+                    current_question_index=0,
+                    total_questions=len(questions),
+                    is_active=True,
+                    is_paused=False
+                )
+                session.add(quiz_session)
+                session.commit()
+                quiz_id = quiz_session.id
+
+            # Send the first question
+            await self._send_quiz_question(self.application, chat_id, quiz_id)
+            await msg.delete()  # Delete the "generating..." message
+
+            logger.info(f"✅ Started quiz session {quiz_id} for user {user_id} about topic '{topic}'")
+
+        except Exception as e:
+            logger.error(f"❌ Error initiating quiz from topic: {e}")
+            await self.application.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Sorry, failed to start the quiz. Please try again."
+            )
+
+    async def _send_quiz_question(self, context_or_app, chat_id: int, quiz_id: int):
+        """Send the current quiz question to the user"""
+        try:
+            with db_manager.get_session() as session:
+                quiz = session.query(QuizSession).filter(QuizSession.id == quiz_id).first()
+
+                if not quiz or not quiz.is_active:
+                    return
+
+                current_idx = quiz.current_question_index
+                question_data = quiz.questions[current_idx]
+
+                # Build question text
+                question_text = f"❓ **Question {current_idx + 1}/{quiz.total_questions}**\n\n"
+                question_text += f"{question_data['question']}\n\n"
+
+                # Create inline keyboard with options
+                keyboard = []
+                for i, option in enumerate(question_data['options']):
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"{chr(65 + i)}) {option}",
+                            callback_data=f"quiz_answer_{quiz_id}_{i}"
+                        )
+                    ])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                # Send question as new message
+                if hasattr(context_or_app, 'bot'):
+                    await context_or_app.bot.send_message(
+                        chat_id=chat_id,
+                        text=question_text,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                else:
+                    await context_or_app.send_message(
+                        chat_id=chat_id,
+                        text=question_text,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+
+        except Exception as e:
+            logger.error(f"❌ Error sending quiz question: {e}")
+
+    async def _handle_quiz_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
+        """Handle user's answer selection"""
+        query = update.callback_query
+        await query.answer()
+
+        try:
+            # Parse callback data: quiz_answer_{quiz_id}_{option_index}
+            parts = callback_data.split("_")
+            quiz_id = int(parts[2])
+            selected_option = int(parts[3])
+
+            # Cache all needed data INSIDE the session scope
+            with db_manager.get_session() as session:
+                quiz = session.query(QuizSession).filter(QuizSession.id == quiz_id).first()
+
+                if not quiz or not quiz.is_active:
+                    await query.edit_message_text("❌ Quiz session not found or expired.")
+                    return
+
+                # Cache data before session closes
+                current_idx = quiz.current_question_index
+                total_questions = quiz.total_questions
+                question_data = quiz.questions[current_idx].copy()  # Make a copy
+                correct_answer = question_data['correct_answer_index']
+                is_correct = (selected_option == correct_answer)
+
+                # Update score
+                if is_correct:
+                    quiz.correct_answers += 1
+                else:
+                    quiz.wrong_answers += 1
+
+                session.commit()
+                # Session closes here - all data is now cached in local variables
+
+            # Edit message to show answer feedback with colored indicators (remove buttons)
+            # Use cached variables instead of quiz object
+            feedback_text = f"❓ **Question {current_idx + 1}/{total_questions}**\n\n"
+            feedback_text += f"{question_data['question']}\n\n"
+
+            # Show options with indicators
+            for i, option in enumerate(question_data['options']):
+                if i == correct_answer:
+                    feedback_text += f"✅ {chr(65 + i)}) {option}\n"
+                elif i == selected_option and not is_correct:
+                    feedback_text += f"❌ {chr(65 + i)}) {option}\n"
+                else:
+                    feedback_text += f"   {chr(65 + i)}) {option}\n"
+
+            feedback_text += f"\n{'🎉 Correct!' if is_correct else '❌ Incorrect!'}\n"
+
+            # Edit the question message to show feedback (no buttons)
+            await query.edit_message_text(
+                text=feedback_text,
+                parse_mode='Markdown'
+            )
+
+            # Automatically send explanation as a NEW message with Continue buttons
+            explanation = question_data.get('explanation', 'No explanation available.')
+            explanation_text = f"💡 **Explanation:**\n\n{explanation}\n\n"
+            explanation_text += "Would you like to continue with the quiz?"
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Yes, Continue", callback_data=f"quiz_continue_{quiz_id}"),
+                    InlineKeyboardButton("❌ No, End Quiz", callback_data=f"quiz_end_{quiz_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=explanation_text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"❌ Error handling quiz answer: {e}")
+            await query.edit_message_text("❌ Error processing your answer.")
+
+    async def _handle_quiz_continue(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
+        """Continue to next question or show results"""
+        query = update.callback_query
+        await query.answer()
+
+        try:
+            # Parse callback data
+            parts = callback_data.split("_")
+            quiz_id = int(parts[2])
+
+            with db_manager.get_session() as session:
+                quiz = session.query(QuizSession).filter(QuizSession.id == quiz_id).first()
+
+                if not quiz:
+                    await query.edit_message_text("❌ Quiz session not found.")
+                    return
+
+                # Cache explanation text before modifying quiz
+                current_idx = quiz.current_question_index
+                question_data = quiz.questions[current_idx]
+                explanation = question_data.get('explanation', 'No explanation available.')
+
+                # Move to next question
+                quiz.current_question_index += 1
+                quiz.last_interaction_at = datetime.now()
+
+                # Check if quiz is complete
+                if quiz.current_question_index >= quiz.total_questions:
+                    # Quiz complete
+                    quiz.is_active = False
+                    quiz.completed_at = datetime.now()
+
+                    # Cache quiz results data before session closes
+                    correct_answers = quiz.correct_answers
+                    wrong_answers = quiz.wrong_answers
+
+                    session.commit()
+
+                    # Remove buttons from explanation message (keep explanation visible)
+                    explanation_text = f"💡 **Explanation:**\n\n{explanation}"
+                    await query.edit_message_text(explanation_text, parse_mode='Markdown')
+
+                    # Show final results as NEW message (don't edit explanation)
+                    await self._show_quiz_results_as_new_message(context, query.message.chat_id, correct_answers, wrong_answers)
+                else:
+                    # More questions remaining
+                    session.commit()
+
+                    # Remove buttons from explanation message (keep the explanation visible)
+                    explanation_text = f"💡 **Explanation:**\n\n{explanation}"
+                    await query.edit_message_text(explanation_text, parse_mode='Markdown')
+
+                    # Send next question as NEW message (don't edit explanation)
+                    await self._send_quiz_question(context, query.message.chat_id, quiz_id)
+
+        except Exception as e:
+            logger.error(f"❌ Error continuing quiz: {e}")
+
+    async def _handle_quiz_no_continue(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
+        """Handle user declining to continue without explanation"""
+        query = update.callback_query
+        await query.answer()
+
+        try:
+            # Parse callback data
+            parts = callback_data.split("_")
+            quiz_id = int(parts[2])
+
+            with db_manager.get_session() as session:
+                quiz = session.query(QuizSession).filter(QuizSession.id == quiz_id).first()
+
+                if not quiz:
+                    await query.edit_message_text("❌ Quiz session not found.")
+                    return
+
+                # Move to next question
+                quiz.current_question_index += 1
+                quiz.last_interaction_at = datetime.now()
+
+                # Check if quiz is complete
+                if quiz.current_question_index >= quiz.total_questions:
+                    # Quiz complete
+                    quiz.is_active = False
+                    quiz.completed_at = datetime.now()
+                    session.commit()
+
+                    # Show final results
+                    await self._show_quiz_results(query, quiz)
+                else:
+                    # More questions remaining
+                    session.commit()
+                    await self._send_quiz_question(context, query.message.chat_id, quiz_id)
+
+        except Exception as e:
+            logger.error(f"❌ Error in quiz no-continue: {e}")
+
+    async def _handle_quiz_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
+        """Resume a paused quiz"""
+        query = update.callback_query
+        await query.answer()
+
+        try:
+            quiz_id = int(callback_data.split("_")[2])
+
+            with db_manager.get_session() as session:
+                quiz = session.query(QuizSession).filter(QuizSession.id == quiz_id).first()
+
+                if not quiz:
+                    await query.edit_message_text("❌ Quiz session not found.")
+                    return
+
+                # Resume quiz
+                quiz.is_paused = False
+                quiz.last_interaction_at = datetime.now()
+                session.commit()
+
+            await query.edit_message_text("Resuming quiz...")
+            await self._send_quiz_question(context, query.message.chat_id, quiz_id)
+
+        except Exception as e:
+            logger.error(f"❌ Error resuming quiz: {e}")
+
+    async def _handle_quiz_end(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
+        """End quiz early"""
+        query = update.callback_query
+        await query.answer()
+
+        try:
+            quiz_id = int(callback_data.split("_")[2])
+
+            with db_manager.get_session() as session:
+                quiz = session.query(QuizSession).filter(QuizSession.id == quiz_id).first()
+
+                if not quiz:
+                    await query.edit_message_text("❌ Quiz session not found.")
+                    return
+
+                # End quiz
+                quiz.is_active = False
+                quiz.completed_at = datetime.now()
+                session.commit()
+
+                # Show results
+                await self._show_quiz_results(query, quiz)
+
+        except Exception as e:
+            logger.error(f"❌ Error ending quiz: {e}")
+
+    async def _show_quiz_results(self, query, quiz: QuizSession):
+        """Show final quiz results (legacy method that edits message)"""
+        try:
+            total = quiz.correct_answers + quiz.wrong_answers
+            percentage = (quiz.correct_answers / total * 100) if total > 0 else 0
+
+            results_text = f"🎯 **Quiz Complete!**\n\n"
+            results_text += f"📊 **Your Results:**\n"
+            results_text += f"✅ Correct: {quiz.correct_answers}\n"
+            results_text += f"❌ Wrong: {quiz.wrong_answers}\n"
+            results_text += f"📈 Score: {percentage:.1f}%\n\n"
+
+            if percentage >= 80:
+                results_text += "🌟 Excellent work! You've mastered this material!"
+            elif percentage >= 60:
+                results_text += "👍 Good job! Keep studying to improve further."
+            else:
+                results_text += "📚 Keep practicing! Review the material and try again."
+
+            results_text += "\n\nIs there any other topic you'd like me to help you with?"
+
+            await query.edit_message_text(results_text, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"❌ Error showing quiz results: {e}")
+
+    async def _show_quiz_results_as_new_message(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, correct_answers: int, wrong_answers: int):
+        """Show final quiz results as a NEW message (preserves explanation)"""
+        try:
+            total = correct_answers + wrong_answers
+            percentage = (correct_answers / total * 100) if total > 0 else 0
+
+            results_text = f"🎯 **Quiz Complete!**\n\n"
+            results_text += f"📊 **Your Results:**\n"
+            results_text += f"✅ Correct: {correct_answers}\n"
+            results_text += f"❌ Wrong: {wrong_answers}\n"
+            results_text += f"📈 Score: {percentage:.1f}%\n\n"
+
+            if percentage >= 80:
+                results_text += "🌟 Excellent work! You've mastered this material!"
+            elif percentage >= 60:
+                results_text += "👍 Good job! Keep studying to improve further."
+            else:
+                results_text += "📚 Keep practicing! Review the material and try again."
+
+            results_text += "\n\nIs there any other topic you'd like me to help you with?"
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=results_text,
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"❌ Error showing quiz results as new message: {e}")
+
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Enhanced error handler with detailed logging and user feedback"""
         error = context.error

@@ -25,7 +25,7 @@ def create_sample_documents():
     logger = logging.getLogger(__name__)
 
     with db_manager.get_session() as session:
-        from src.data.models import Document, Course
+        from src.data.models import Document, Course, User
 
         # Get a course to add documents to
         course = session.query(Course).first()
@@ -33,9 +33,16 @@ def create_sample_documents():
             logger.warning("No courses found in database - cannot test notifications")
             return []
 
+        # Get a user to be the owner of these documents
+        user = session.query(User).first()
+        if not user:
+            logger.warning("No users found in database - cannot create documents for test")
+            return []
+
         # Sample documents with different types
         sample_docs = [
             {
+                'user_id': user.id, # Assign to the user
                 'title': 'Programming Assignment 1 - Data Structures',
                 'file_type': 'pdf',
                 'course_id': course.id,
@@ -44,6 +51,7 @@ def create_sample_documents():
                 'processing_status': 'completed'
             },
             {
+                'user_id': user.id, # Assign to the user
                 'title': 'Midterm Quiz - Database Concepts',
                 'file_type': 'pdf',
                 'course_id': course.id,
@@ -52,6 +60,7 @@ def create_sample_documents():
                 'processing_status': 'completed'
             },
             {
+                'user_id': user.id, # Assign to the user
                 'title': 'Chapter 5 - Advanced SQL Notes',
                 'file_type': 'pdf',
                 'course_id': course.id,

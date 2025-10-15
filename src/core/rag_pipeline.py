@@ -13,7 +13,7 @@ import time
 
 from config.settings import settings
 from config.database import db_manager
-from src.data.models import Document, DocumentEmbedding
+from src.data.models import Document, DocumentEmbedding, DocumentAccess
 from src.services.document_processor import DocumentProcessor
 from src.services.llm_integration import LLMService
 
@@ -100,6 +100,19 @@ class RAGPipeline:
         BATCH_COMMIT_SIZE = 50  # Commit every 50 chunks to avoid Supabase connection timeouts
 
         try:
+            # [FIX] Delete existing embeddings first to ensure idempotency (for reprocessing)
+            with db_manager.get_session() as session:
+                existing_count = session.query(DocumentEmbedding).filter(DocumentEmbedding.document_id == document_id).count()
+
+                if existing_count > 0:
+                    logger.info(f"Deleting {existing_count} existing embeddings for document ID: {document_id} (reprocessing)")
+                    session.query(DocumentEmbedding).filter(DocumentEmbedding.document_id == document_id).delete(synchronize_session=False)
+                    session.commit()
+                    self.collection.delete(where={"document_id": document_id})
+                    logger.info(f"Successfully deleted {existing_count} old entries for document ID: {document_id}")
+                else:
+                    logger.info(f"Processing new document ID: {document_id} (no existing embeddings)")
+
             # First, get document metadata in a quick session
             with db_manager.get_session() as session:
                 document = session.query(Document).filter(Document.id == document_id).first()
@@ -124,6 +137,7 @@ class RAGPipeline:
                 doc_course_code = document.course.course_code if document.course else 'Unknown'
 
             # Process document into chunks (outside database session)
+            # NOTE: user_id is NOT stored in metadata anymore - access control via DocumentAccess table
             metadata = {
                 'document_id': document_id,
                 'title': doc_title,
@@ -224,12 +238,25 @@ class RAGPipeline:
             return False
     
     @retry_with_backoff(max_retries=2, base_delay=0.5)
-    def retrieve_relevant_chunks(self, query: str, course_id: Optional[int] = None, document_id: Optional[int] = None, top_k: int = None) -> List[Dict[str, Any]]:
-        """Retrieve most relevant chunks for a given query"""
+    def retrieve_relevant_chunks(self, query: str, user_id: int, course_id: Optional[int] = None, document_id: Optional[int] = None, top_k: int = None, min_similarity: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Retrieve most relevant chunks for a given query, filtered by user access.
+
+        Args:
+            query: Search query text
+            user_id: User ID for access control filtering
+            course_id: Optional course filter
+            document_id: Optional document filter
+            top_k: Number of results to retrieve
+            min_similarity: Minimum similarity threshold (default 0.1). Set to 0 to get all chunks.
+        """
         try:
             # Use configured top_k if not specified
             if top_k is None:
                 top_k = settings.TOP_K_RETRIEVAL
+
+            # Default minimum similarity threshold
+            if min_similarity is None:
+                min_similarity = 0.1  # 10% default threshold
 
             # Generate query embedding
             logger.info(f"Using embedding model: {self.embedding_model_name}")
@@ -237,21 +264,52 @@ class RAGPipeline:
             logger.info(f"Query embedding shape: {len(query_embedding)}")
             logger.info(f"Query embedding sample: {query_embedding[:5]}")  # First 5 values
 
+            # Get list of document IDs user has access to via DocumentAccess table
+            with db_manager.get_session() as session:
+                accessible_doc_ids = [
+                    access.document_id
+                    for access in session.query(DocumentAccess).filter(
+                        DocumentAccess.user_id == user_id,
+                        DocumentAccess.is_active == True
+                    ).all()
+                ]
+
+            if not accessible_doc_ids:
+                logger.warning(f"User {user_id} has no accessible documents")
+                return []
+
+            logger.info(f"User {user_id} has access to {len(accessible_doc_ids)} documents")
+
             # Prepare filter for document/course-specific search
-            where_filter = {}
+            filter_conditions = []
+
             if document_id:
-                where_filter["document_id"] = document_id
-                logger.info(f"Filtering by document_id: {document_id}")
-            elif course_id:
-                where_filter["course_id"] = course_id
-                logger.info(f"Filtering by course_id: {course_id}")
+                # Verify user has access to this specific document
+                if document_id not in accessible_doc_ids:
+                    logger.warning(f"User {user_id} does not have access to document {document_id}")
+                    return []
+                filter_conditions.append({"document_id": document_id})
+                logger.info(f"Filtering by document_id: {document_id} (min_similarity: {min_similarity})")
+            else:
+                # Filter by ALL accessible documents
+                # ChromaDB uses $in operator for list filtering
+                filter_conditions.append({"document_id": {"$in": accessible_doc_ids}})
+                logger.info(f"Filtering by {len(accessible_doc_ids)} accessible documents")
+
+            if course_id:
+                # Additional course filter if specified
+                filter_conditions.append({"course_id": course_id})
+                logger.info(f"Additional filter by course_id: {course_id}")
+
+            # Combine conditions using $and if there are multiple, otherwise use the single condition.
+            where_filter = {"$and": filter_conditions} if len(filter_conditions) > 1 else filter_conditions[0]
 
             # Search in ChromaDB with where filter
             try:
                 results = self.collection.query(
                     query_embeddings=[query_embedding],
                     n_results=top_k,
-                    where=where_filter if where_filter else None,
+                    where=where_filter,
                     include=['documents', 'metadatas', 'distances']
                 )
                 if where_filter:
@@ -288,10 +346,10 @@ class RAGPipeline:
                         similarity_score = 1 - distance
 
                     # Add debug logging
-                    logger.info(f"Chunk {i+1}: similarity={similarity_score:.3f}, threshold={settings.SIMILARITY_THRESHOLD}")
+                    logger.info(f"Chunk {i+1}: similarity={similarity_score:.3f}, threshold={min_similarity}")
 
-                    # Use a reasonable threshold now that we fixed distance calculation
-                    if similarity_score >= 0.1:  # Accept chunks with 10%+ similarity
+                    # Apply similarity threshold (can be 0 for document-specific retrieval)
+                    if similarity_score >= min_similarity:
                         relevant_chunks.append({
                             'text': doc,
                             'metadata': metadata,
@@ -338,15 +396,32 @@ class RAGPipeline:
             logger.error(f"Error retrieving relevant chunks: {e}")
             return []
     
-    def generate_context(self, query: str, course_id: Optional[int] = None, document_id: Optional[int] = None, max_context_length: Optional[int] = None) -> Dict[str, Any]:
-        """Generate enhanced context for RAG-enhanced response with better source integration"""
+    def generate_context(self, query: str, user_id: int, course_id: Optional[int] = None, document_id: Optional[int] = None, max_context_length: Optional[int] = None, min_similarity: Optional[float] = None) -> Dict[str, Any]:
+        """Generate enhanced context for RAG-enhanced response with better source integration
+
+        Args:
+            query: Search query text
+            user_id: User ID for filtering
+            course_id: Optional course filter
+            document_id: Optional document filter
+            max_context_length: Maximum context length in characters
+            min_similarity: Minimum similarity threshold (default 0.1). Use 0 for document-specific queries.
+        """
         try:
             # Use configurable context length
             if max_context_length is None:
                 max_context_length = settings.CONTEXT_MAX_LENGTH
 
-            # Retrieve relevant chunks with higher similarity threshold for better quality
-            relevant_chunks = self.retrieve_relevant_chunks(query, course_id, document_id, top_k=settings.TOP_K_RETRIEVAL)
+            # Retrieve relevant chunks
+            # For document-specific queries, use lower threshold to get more content
+            relevant_chunks = self.retrieve_relevant_chunks(
+                query,
+                user_id,
+                course_id,
+                document_id,
+                top_k=settings.TOP_K_RETRIEVAL,
+                min_similarity=min_similarity
+            )
 
             if not relevant_chunks:
                 return {
@@ -450,7 +525,7 @@ class RAGPipeline:
             # Simple fallback if LLM fails
             return "I'm here to help with your studies! Feel free to ask me about your course materials or any academic topics."
 
-    def generate_rag_response(self, query: str, course_id: Optional[int] = None, document_id: Optional[int] = None, user_preferences: Dict[str, Any] = None) -> Dict[str, Any]:
+    def generate_rag_response(self, query: str, user_id: int, course_id: Optional[int] = None, document_id: Optional[int] = None, user_preferences: Dict[str, Any] = None) -> Dict[str, Any]:
         """Generate complete RAG response using LLM with retrieved context
 
         Strategy: RAG-first approach
@@ -476,7 +551,7 @@ class RAGPipeline:
 
             # For all other queries: Always try RAG first
             logger.info(f"Searching course materials for: '{query[:50]}...'")
-            context_data = self.generate_context(query, course_id, document_id)
+            context_data = self.generate_context(query, user_id, course_id, document_id)
 
             # Check if we have relevant content based on similarity threshold
             avg_similarity = context_data.get('average_similarity', 0)
@@ -568,15 +643,338 @@ class RAGPipeline:
         else:
             return 'low'
         
+    def generate_quiz_questions(self, user_id: int, document_id: Optional[int] = None, topic: Optional[str] = None, num_questions: int = 5) -> List[Dict[str, Any]]:
+        """Generate quiz questions from document or topic using RAG and LLM
+
+        Args:
+            user_id: ID of the user requesting quiz questions (for document filtering)
+            document_id: Optional specific document to generate questions from
+            topic: Optional topic to search for and generate questions about
+            num_questions: Number of questions to generate (default: 5)
+
+        Returns list of question objects:
+        [
+            {
+                'question': 'What is...?',
+                'options': ['Option A', 'Option B', 'Option C', 'Option D'],
+                'correct_answer_index': 0,
+                'explanation': 'The correct answer is A because...'
+            },
+            ...
+        ]
+        """
+        try:
+            # Retrieve relevant content
+            if document_id:
+                # Get content from specific document
+                # Use min_similarity=0 to get ALL chunks from the document regardless of semantic match
+                # This is important because quiz queries are meta-instructions, not content queries
+                # Request up to 50 chunks to get comprehensive coverage of the document
+                query = f"Generate comprehensive quiz questions covering the key concepts from this document"
+
+                # First get chunks with no similarity filtering
+                relevant_chunks = self.retrieve_relevant_chunks(
+                    query,
+                    user_id=user_id,
+                    document_id=document_id,
+                    top_k=50,  # Get more chunks for comprehensive quiz
+                    min_similarity=0.0  # Accept all chunks from the document
+                )
+
+                if not relevant_chunks:
+                    logger.warning(f"No chunks found for document ID {document_id}")
+                    return []
+
+                # Build context from chunks
+                context_parts = []
+                current_length = 0
+                max_length = 4000  # Context limit for quiz generation
+
+                for chunk in relevant_chunks:
+                    chunk_text = chunk['text']
+                    if current_length + len(chunk_text) > max_length:
+                        break
+                    context_parts.append(chunk_text)
+                    current_length += len(chunk_text)
+
+                context = "\n\n".join(context_parts)
+                context_data = {
+                    'context': context,
+                    'has_relevant_content': len(context_parts) > 0,
+                    'sources': [{'title': chunk['metadata'].get('title', 'Unknown')} for chunk in relevant_chunks[:3]]
+                }
+
+                source_description = f"document ID {document_id}"
+                logger.info(f"Generated quiz context from {len(context_parts)} chunks ({current_length} chars) for {source_description}")
+
+            elif topic:
+                # Get content from topic search (use default similarity threshold)
+                query = f"Generate quiz questions about {topic}"
+                context_data = self.generate_context(query, user_id=user_id)
+                source_description = f"topic '{topic}'"
+            else:
+                logger.error("Either document_id or topic must be provided")
+                return []
+
+            if not context_data.get('has_relevant_content'):
+                logger.warning(f"No relevant content found for {source_description}")
+                return []
+
+            context = context_data['context']
+
+            # Create prompt for question generation
+            prompt = f"""Based on the following course materials, generate {num_questions} multiple-choice quiz questions to test student understanding.
+
+COURSE MATERIALS:
+{context[:4000]}
+
+REQUIREMENTS:
+1. Generate exactly {num_questions} multiple-choice questions
+2. Each question should have 4 options (A, B, C, D)
+3. Only ONE option should be correct
+4. Include a brief explanation for why the correct answer is right
+5. Questions should test understanding, not just memorization
+6. Focus on key concepts and important details from the material
+
+FORMAT YOUR RESPONSE EXACTLY LIKE THIS (do not deviate from this format):
+QUESTION 1: [Your question here]
+A) [First option]
+B) [Second option]
+C) [Third option]
+D) [Fourth option]
+CORRECT: [A/B/C/D]
+EXPLANATION: [Why this answer is correct]
+
+QUESTION 2: [Your question here]
+A) [First option]
+B) [Second option]
+C) [Third option]
+D) [Fourth option]
+CORRECT: [A/B/C/D]
+EXPLANATION: [Why this answer is correct]
+
+[Continue for all {num_questions} questions...]
+
+Now generate the questions:"""
+
+            # Use LLM to generate questions
+            llm_response = self.llm_service.generate_response(
+                query="Generate quiz questions",
+                context=prompt,
+                user_preferences=None
+            )
+
+            # Log the raw LLM response for debugging
+            logger.info(f"Raw LLM response (first 500 chars): {llm_response[:500]}")
+
+            # Parse the LLM response into structured questions
+            questions = self._parse_quiz_questions(llm_response)
+
+            # If parsing failed completely, try a simpler prompt format
+            if len(questions) == 0:
+                logger.warning("First attempt failed. Trying simplified prompt format...")
+                simplified_prompt = f"""Based on this material, create {num_questions} multiple choice questions.
+
+MATERIAL:
+{context[:3000]}
+
+For each question, use this EXACT format:
+
+1. [Question text here]
+A. [Option 1]
+B. [Option 2]
+C. [Option 3]
+D. [Option 4]
+CORRECT: [A/B/C/D]
+EXPLANATION: [Why this is correct]
+
+2. [Question text here]
+A. [Option 1]
+B. [Option 2]
+C. [Option 3]
+D. [Option 4]
+CORRECT: [A/B/C/D]
+EXPLANATION: [Why this is correct]
+
+Generate {num_questions} questions now:"""
+
+                llm_response = self.llm_service.generate_response(
+                    query="Generate quiz questions",
+                    context=simplified_prompt,
+                    user_preferences=None
+                )
+                logger.info(f"Simplified LLM response (first 500 chars): {llm_response[:500]}")
+                questions = self._parse_quiz_questions(llm_response)
+
+            if len(questions) < num_questions:
+                logger.warning(f"Generated {len(questions)} questions, expected {num_questions}")
+                if len(questions) == 0:
+                    logger.error(f"LLM failed to generate parseable questions. Final response: {llm_response[:1000]}")
+
+            logger.info(f"Successfully generated {len(questions)} quiz questions for {source_description}")
+            return questions
+
+        except Exception as e:
+            logger.error(f"Error generating quiz questions: {e}")
+            return []
+
+    def _parse_quiz_questions(self, llm_response: str) -> List[Dict[str, Any]]:
+        """Parse LLM response into structured question objects - more robust parsing"""
+        questions = []
+
+        try:
+            import re
+
+            # Try multiple parsing strategies
+
+            # Strategy 1: Standard format with "QUESTION N:"
+            question_blocks = re.split(r'(?:QUESTION|Question)\s*\d+\s*:', llm_response, flags=re.IGNORECASE)[1:]
+
+            if not question_blocks or len(question_blocks) < 2:
+                # Strategy 2: Split by numbered pattern (works for inline format)
+                # First, add newlines before numbers followed by periods to separate questions
+                normalized = re.sub(r'(\d+)\.\s+', r'\n\1. ', llm_response)
+
+                # Extract question blocks by number  pattern
+                question_pattern = r'(\d+\.\s+.+?(?=\d+\.\s+|$))'
+                potential_blocks = re.findall(question_pattern, normalized, re.DOTALL)
+
+                # Filter blocks that look like actual questions (have options A, B, C, D)
+                question_blocks = []
+                for block in potential_blocks:
+                    # Check if block has all required components
+                    has_options = all(re.search(rf'{letter}[\.\)]', block, re.IGNORECASE) for letter in ['A', 'B', 'C', 'D'])
+                    has_explanation = re.search(r'(CORRECT|EXPLANATION|Answer)', block, re.IGNORECASE)
+
+                    if has_options and has_explanation:
+                        question_blocks.append(block.strip())
+
+                logger.info(f"Strategy 2: Found {len(question_blocks)} blocks using numbered format")
+
+            if not question_blocks:
+                logger.warning("Could not split LLM response into question blocks")
+                logger.debug(f"Full LLM response for debugging: {llm_response}")
+                return []
+
+            logger.info(f"Successfully split into {len(question_blocks)} question blocks")
+
+            for block_idx, block in enumerate(question_blocks):
+                try:
+                    # CRITICAL FIX: LLM often puts everything on one line
+                    # Add newlines before options (A., B., C., D.) and keywords (CORRECT, EXPLANATION)
+                    block = re.sub(r'\s+([A-D][\.\)])', r'\n\1', block)  # Add newline before A. B. C. D.
+                    block = re.sub(r'\s+(CORRECT|Correct answer):', r'\n\1:', block, flags=re.IGNORECASE)
+                    block = re.sub(r'\s+(EXPLANATION|Explanation):', r'\n\1:', block, flags=re.IGNORECASE)
+
+                    lines = [line.strip() for line in block.strip().split('\n') if line.strip()]
+
+                    if len(lines) < 5:  # Minimum: question + 4 options + correct (explanation optional)
+                        logger.warning(f"Block {block_idx} has too few lines ({len(lines)}). Block: {block[:200]}")
+                        continue
+
+                    # Extract question text (first non-empty line, remove number prefix if present)
+                    question_text = lines[0]
+                    # Remove leading number like "1. " from question text
+                    question_text = re.sub(r'^\d+\.\s*', '', question_text)
+
+                    # Extract options - be more flexible with formats
+                    options = []
+                    # Match patterns like "A)", "A.", "A:", "a)", etc.
+                    option_pattern = re.compile(r'^([A-Da-d])[\)\.\:]\s*(.+)', re.IGNORECASE)
+
+                    for line in lines[1:]:
+                        match = option_pattern.match(line)
+                        if match:
+                            options.append(match.group(2).strip())
+                        if len(options) == 4:
+                            break
+
+                    if len(options) != 4:
+                        logger.warning(f"Block {block_idx}: Found {len(options)} options (expected 4). Lines: {lines[:10]}")
+                        continue
+
+                    # Extract correct answer - try multiple formats
+                    # Search in the entire block text, not line by line
+                    block_text = '\n'.join(lines)
+                    correct_line = None
+                    correct_patterns = [
+                        r'CORRECT\s*:?\s*([A-D])',  # CORRECT: A
+                        r'Correct\s+answer\s*:?\s*([A-D])',  # Correct answer: A
+                        r'Answer\s*:?\s*([A-D])',  # Answer: A
+                        r'EXPLANATION\s*:?\s*([A-D])[\.\)]',  # EXPLANATION: B. (answer at start of explanation)
+                        r'answer\s+is\s+([A-D])[\.\)]',  # "The answer is B."
+                        r'option\s+([A-D])',  # "option B"
+                    ]
+
+                    for pattern in correct_patterns:
+                        match = re.search(pattern, block_text, re.IGNORECASE)
+                        if match:
+                            correct_line = match.group(1).upper()
+                            logger.debug(f"Found correct answer '{correct_line}' using pattern: {pattern}")
+                            break
+
+                    if not correct_line:
+                        logger.warning(f"Block {block_idx}: No correct answer found. Block preview: {block_text[:300]}")
+                        # Try to infer from explanation text which option is mentioned
+                        for letter in ['A', 'B', 'C', 'D']:
+                            # Look for patterns like "B is correct" or "choose B"
+                            if re.search(rf'\b{letter}\b.*?correct', block_text, re.IGNORECASE) or \
+                               re.search(rf'choose\s+{letter}', block_text, re.IGNORECASE):
+                                correct_line = letter
+                                logger.info(f"Inferred correct answer: {letter}")
+                                break
+
+                    if not correct_line:
+                        # Last resort: default to B (middle option)
+                        correct_line = 'B'
+                        logger.warning(f"Could not find correct answer, defaulting to B")
+
+                    correct_index = ord(correct_line) - ord('A') if correct_line in 'ABCD' else 0
+
+                    # Extract explanation - try multiple formats
+                    explanation = "No explanation provided"
+                    explanation_patterns = [
+                        r'EXPLANATION\s*:?\s*(.+)',
+                        r'Explanation\s*:?\s*(.+)',
+                        r'Because\s+(.+)',
+                    ]
+
+                    for line in lines:
+                        for pattern in explanation_patterns:
+                            match = re.search(pattern, line, re.IGNORECASE)
+                            if match:
+                                explanation = match.group(1).strip()
+                                break
+                        if explanation != "No explanation provided":
+                            break
+
+                    questions.append({
+                        'question': question_text,
+                        'options': options,
+                        'correct_answer_index': correct_index,
+                        'explanation': explanation
+                    })
+
+                    logger.debug(f"Successfully parsed question {len(questions)}: {question_text[:50]}...")
+
+                except Exception as parse_error:
+                    logger.warning(f"Error parsing question block {block_idx}: {parse_error}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error parsing quiz questions from LLM response: {e}")
+
+        return questions
+
     def get_vector_store_stats(self) -> Dict[str, Any]:
         """Get statistics about the vector store"""
         try:
             count = self.collection.count()
-            
+
             with db_manager.get_session() as session:
                 processed_docs = session.query(Document).filter(Document.is_processed == True).count()
                 total_docs = session.query(Document).count()
-            
+
             return {
                 'total_embeddings': count,
                 'processed_documents': processed_docs,
@@ -584,7 +982,7 @@ class RAGPipeline:
                 'processing_rate': f"{(processed_docs/total_docs*100):.1f}%" if total_docs > 0 else "0%",
                 'llm_service_available': self.llm_service is not None
             }
-            
+
         except Exception as e:
             logger.error(f"Error getting vector store stats: {e}")
             return {

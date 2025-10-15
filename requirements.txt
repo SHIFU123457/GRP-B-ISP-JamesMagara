@@ -42,6 +42,14 @@
 #mammoth
 #pdfplumber
 
+# OCR support for scanned PDFs
+pdf2image==1.16.3
+pytesseract==0.3.10
+# Note: Also requires Tesseract OCR engine to be installed on system
+# Windows: https://github.com/UB-Mannheim/tesseract/wiki
+# Linux: sudo apt-get install tesseract-ocr
+# macOS: brew install tesseract
+
 #For (moodle and HuggingFace) HTTP and API I installed
 #requests==2.31.0
 #urllib3==2.1.0

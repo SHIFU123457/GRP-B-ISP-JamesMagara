@@ -124,6 +124,7 @@ class Document(Base):
     __tablename__ = "documents"
     
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True) # Added for multi-user data isolation
     course_id = Column(Integer, ForeignKey("courses.id"), nullable=False)
     
     # Document details
@@ -161,6 +162,7 @@ class Document(Base):
     course = relationship("Course", back_populates="documents")
     embeddings = relationship("DocumentEmbedding", back_populates="document")
     user_notifications = relationship("UserNotification", back_populates="document")
+    document_access = relationship("DocumentAccess", back_populates="document")
 
 class UserNotification(Base):
     """Track notifications per user per document for multi-user courses"""
@@ -184,6 +186,36 @@ class UserNotification(Base):
     # Ensure one notification record per user per document
     __table_args__ = (
         UniqueConstraint('user_id', 'document_id', name='uq_user_document_notification'),
+    )
+
+class DocumentAccess(Base):
+    """Track which users can access which documents (access control layer)
+
+    This enables:
+    - One document stored, shared by multiple users
+    - Fine-grained access control per user
+    - Efficient storage (no duplicate files)
+    - Clear audit trail of who has access
+    """
+    __tablename__ = "document_access"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False, index=True)
+
+    # Access metadata
+    granted_at = Column(DateTime(timezone=True), server_default=func.now())
+    access_source = Column(String, default="enrollment")  # enrollment, notification, manual, shared
+    revoked_at = Column(DateTime(timezone=True))  # If access is revoked
+    is_active = Column(Boolean, default=True)
+
+    # Relationships
+    user = relationship("User")
+    document = relationship("Document", back_populates="document_access")
+
+    # Ensure one access record per user-document pair
+    __table_args__ = (
+        UniqueConstraint('user_id', 'document_id', name='uq_user_document_access'),
     )
 
 class DocumentEmbedding(Base):
@@ -253,29 +285,60 @@ class SystemLog(Base):
 class PersonalizationProfile(Base):
     """Detailed personalization profile for each user"""
     __tablename__ = "personalization_profiles"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    
+
     # Learning analytics
     avg_session_duration = Column(Float, default=0.0)  # minutes
     preferred_response_length = Column(String, default="medium")  # short, medium, long
     question_complexity_level = Column(Float, default=0.5)  # 0-1 scale
-    
+
     # Interaction patterns
     most_active_hours = Column(JSON)  # list of hours when user is most active
     preferred_subjects = Column(JSON)  # list of subjects user asks about most
     learning_pace = Column(String, default="medium")  # slow, medium, fast
-    
+
     # Performance tracking
     total_interactions = Column(Integer, default=0)
     successful_interactions = Column(Integer, default=0)  # based on user ratings
     last_interaction = Column(DateTime(timezone=True))
-    
+
     # Model data (for ML algorithms)
     feature_vector = Column(JSON)  # cached features for ML models
     last_model_update = Column(DateTime(timezone=True))
-    
+
     # Metadata
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+class QuizSession(Base):
+    """Track active quiz sessions for users"""
+    __tablename__ = "quiz_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=True)  # Null if topic-based quiz
+
+    # Quiz details
+    topic = Column(String)  # The topic being quizzed on (if not document-specific)
+    questions = Column(JSON, nullable=False)  # List of question objects with options, correct answer, explanation
+    current_question_index = Column(Integer, default=0)
+    total_questions = Column(Integer, nullable=False)
+
+    # State tracking
+    is_active = Column(Boolean, default=True)
+    is_paused = Column(Boolean, default=False)
+
+    # Performance tracking
+    correct_answers = Column(Integer, default=0)
+    wrong_answers = Column(Integer, default=0)
+
+    # Metadata
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_interaction_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True))
+
+    # Relationships
+    user = relationship("User")
+    document = relationship("Document")

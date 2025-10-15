@@ -10,6 +10,15 @@ import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
 
+# OCR imports (optional - will gracefully degrade if not available)
+try:
+    from pdf2image import convert_from_path
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    logging.warning("OCR libraries (pdf2image, pytesseract) not installed. Scanned PDFs will not be processed.")
+
 logger = logging.getLogger(__name__)
 
 def safe_file_operation(operation_name: str):
@@ -68,7 +77,7 @@ class DocumentProcessor:
     
     @safe_file_operation("PDF text extraction")
     def _extract_pdf_text(self, file_path: str) -> str:
-        """Extract text from PDF files using PyMuPDF (fallback to PyPDF2)"""
+        """Extract text from PDF files using PyMuPDF (fallback to PyPDF2, then OCR)"""
         text = ""
 
         try:
@@ -92,13 +101,77 @@ class DocumentProcessor:
                 pdf_reader = PyPDF2.PdfReader(file)
                 for page in pdf_reader.pages:
                     text += page.extract_text() + "\n"
-            logger.info(f"Extracted {len(text)} characters using PyPDF2 fallback")
+
+            # Check if PyPDF2 got good text
+            if len(text.strip()) > 50:
+                logger.info(f"Extracted {len(text)} characters using PyPDF2 fallback")
+                return text.strip()
+            else:
+                logger.warning(f"PyPDF2 extracted insufficient text ({len(text)} chars), trying OCR...")
         except Exception as e:
-            logger.error(f"Both PDF extraction methods failed for {file_path}: {e}")
-            return ""
+            logger.warning(f"PyPDF2 extraction failed for {file_path}: {e}, trying OCR...")
+
+        # Final fallback: OCR for scanned/image PDFs
+        if OCR_AVAILABLE:
+            try:
+                ocr_text = self._extract_pdf_with_ocr(file_path)
+                if ocr_text and len(ocr_text.strip()) > 50:
+                    logger.info(f"Successfully extracted {len(ocr_text)} characters using OCR")
+                    return ocr_text.strip()
+                else:
+                    logger.error(f"OCR extraction failed or returned insufficient text from {file_path}")
+            except Exception as e:
+                logger.error(f"OCR extraction failed for {file_path}: {e}")
+        else:
+            logger.error(f"OCR not available. Cannot process scanned PDF: {file_path}")
+            logger.info("Install OCR support with: pip install pdf2image pytesseract")
+            logger.info("Also install Tesseract OCR: https://github.com/tesseract-ocr/tesseract")
 
         return text.strip()
-    
+
+    def _extract_pdf_with_ocr(self, file_path: str) -> str:
+        """Extract text from PDF using OCR (for scanned/image PDFs)"""
+        if not OCR_AVAILABLE:
+            logger.error("OCR libraries not available")
+            return ""
+
+        try:
+            logger.info(f"Converting PDF to images for OCR: {file_path}")
+            # Convert PDF pages to images
+            images = convert_from_path(file_path, dpi=300)  # Higher DPI for better OCR accuracy
+
+            logger.info(f"Running OCR on {len(images)} pages...")
+            text_parts = []
+
+            for i, image in enumerate(images, 1):
+                logger.info(f"Processing page {i}/{len(images)} with OCR...")
+                # Extract text from image using Tesseract
+                page_text = pytesseract.image_to_string(image, lang='eng')
+
+                if page_text.strip():
+                    text_parts.append(f"--- Page {i} ---\n{page_text}")
+                    logger.debug(f"Page {i}: Extracted {len(page_text)} characters")
+                else:
+                    logger.warning(f"Page {i}: No text extracted")
+
+            final_text = "\n\n".join(text_parts)
+            logger.info(f"OCR completed: {len(final_text)} total characters from {len(images)} pages")
+
+            return final_text
+
+        except Exception as e:
+            logger.error(f"OCR processing failed: {e}")
+            # Check if Tesseract is installed
+            try:
+                import subprocess
+                subprocess.run(['tesseract', '--version'], capture_output=True, check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                logger.error("Tesseract OCR engine not found. Please install it:")
+                logger.error("  Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki")
+                logger.error("  Linux: sudo apt-get install tesseract-ocr")
+                logger.error("  macOS: brew install tesseract")
+            return ""
+
     @safe_file_operation("DOCX text extraction")
     def _extract_docx_text(self, file_path: str) -> str:
         """Extract text from Word documents"""
