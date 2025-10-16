@@ -36,6 +36,7 @@ class Settings:
     # Personalization Settings
     MIN_INTERACTIONS_FOR_PERSONALIZATION: int = int(os.getenv("MIN_INTERACTIONS_FOR_PERSONALIZATION", "5"))
     LEARNING_STYLE_UPDATE_INTERVAL: int = int(os.getenv("LEARNING_STYLE_UPDATE_INTERVAL", "24"))
+    SESSION_TIMEOUT_MINUTES: int = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))  # Conversation session timeout
 
     # RAG Pipeline Settings
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "300"))  # words per chunk (optimized)

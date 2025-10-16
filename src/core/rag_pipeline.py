@@ -16,6 +16,7 @@ from config.database import db_manager
 from src.data.models import Document, DocumentEmbedding, DocumentAccess
 from src.services.document_processor import DocumentProcessor
 from src.services.llm_integration import LLMService
+from src.services.adaptive_response_engine import adaptive_response_engine
 
 logger = logging.getLogger(__name__)
 
@@ -571,11 +572,42 @@ class RAGPipeline:
                     'reason': 'low_similarity_fallback'
                 }
 
-            # Generate response using LLM with context
+            # Use adaptive response engine to enhance prompt with personalization
+            with db_manager.get_session() as session:
+                try:
+                    # Build base prompt with context
+                    base_prompt = f"""You are an AI study assistant. Base your answer on the provided course materials.
+
+COURSE MATERIALS:
+{context_data['context'][:5000]}
+
+STUDENT QUESTION: {query}
+
+ANSWER:"""
+
+                    # Enhance prompt with adaptive features
+                    enhanced_prompt, metadata = adaptive_response_engine.analyze_and_enhance_prompt(
+                        user_id=user_id,
+                        query=query,
+                        base_prompt=base_prompt,
+                        session=session
+                    )
+
+                    logger.info(f"Adaptive response metadata: verbosity={metadata.get('verbosity_score'):.1f}/10, "
+                               f"style={metadata.get('explanation_style', 'adaptive')}, "
+                               f"sentiment={metadata.get('sentiment', {}).get('detected_patterns', [])}, "
+                               f"topics={metadata.get('current_topics', [])}")
+
+                except Exception as adapt_error:
+                    logger.warning(f"Adaptive engine failed, using standard prompt: {adapt_error}")
+                    enhanced_prompt = None
+
+            # Generate response using LLM with enhanced prompt
             response = self.llm_service.generate_response(
                 query,
                 context_data['context'],
-                user_preferences
+                user_preferences,
+                enhanced_prompt=enhanced_prompt  # Pass enhanced prompt
             )
 
             # Enhance response with source information

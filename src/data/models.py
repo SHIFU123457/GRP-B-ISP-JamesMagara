@@ -342,3 +342,33 @@ class QuizSession(Base):
     # Relationships
     user = relationship("User")
     document = relationship("Document")
+
+class ConversationSession(Base):
+    """Track conversation sessions for context continuity and personalization"""
+    __tablename__ = "conversation_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    session_id = Column(String, unique=True, index=True, nullable=False)  # UUID for session tracking
+
+    # Session state
+    is_active = Column(Boolean, default=True, index=True)
+    session_context = Column(JSON, default=lambda: {})  # Store conversation context (topics, current course, etc.)
+
+    # Session analytics
+    message_count = Column(Integer, default=0)
+    questions_asked = Column(Integer, default=0)
+    commands_used = Column(Integer, default=0)
+
+    # Temporal tracking
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_activity_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    ended_at = Column(DateTime(timezone=True))
+
+    # Session metadata
+    session_duration_minutes = Column(Float, default=0.0)  # Calculated on session end
+    primary_topic = Column(String)  # Main topic discussed in this session
+    courses_discussed = Column(JSON, default=lambda: [])  # List of course IDs mentioned
+
+    # Relationships
+    user = relationship("User")

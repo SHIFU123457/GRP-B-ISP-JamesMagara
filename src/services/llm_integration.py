@@ -238,11 +238,21 @@ class LLMService:
 
         return None
     
-    def generate_response(self, query: str, context: str = "", user_preferences: Dict[str, Any] = None) -> str:
-        """Generate response using available LLM with enhanced context integration"""
+    def generate_response(self, query: str, context: str = "", user_preferences: Dict[str, Any] = None, enhanced_prompt: str = None) -> str:
+        """Generate response using available LLM with enhanced context integration
+
+        Args:
+            query: User's query
+            context: Retrieved context from RAG
+            user_preferences: Optional user preferences dict
+            enhanced_prompt: Pre-built enhanced prompt from adaptive engine (overrides default)
+        """
         try:
+            # Use enhanced prompt if provided (from adaptive response engine)
+            if enhanced_prompt:
+                prompt = enhanced_prompt
             # Prepare enhanced prompt with context
-            if context.strip():
+            elif context.strip():
                 # Use more context and make it more directive
                 prompt = f"""You are an AI study assistant. IMPORTANT: Base your answer EXCLUSIVELY on the provided course materials below. Do NOT use external knowledge.
 

@@ -14,7 +14,7 @@ from telegram.ext import (
 )
 from sqlalchemy.orm import Session
 
-from src.data.models import User, UserInteraction, PersonalizationProfile, QuizSession
+from src.data.models import User, UserInteraction, PersonalizationProfile, QuizSession, ConversationSession
 from config.database import db_manager
 from config.settings import settings
 #For RAG functionality
@@ -23,6 +23,8 @@ from src.core.rag_pipeline import RAGPipeline
 from src.services.scheduler import scheduler_service, escape_markdown
 from src.services.lms_integration import lms_service
 from src.data.models import User, UserInteraction, PersonalizationProfile, Course, Document, CourseEnrollment
+#For personalization and session management
+from src.services.personalization_engine import personalization_engine, session_manager
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +216,16 @@ class StudyHelperBot:
         try:
             with db_manager.get_session() as session:
                 user = self._get_or_create_user(session, user_data)
+
+                # Get or create conversation session
+                conv_session = session_manager.get_or_create_session(user.id, session)
+
+                # Update session activity for command
+                session_manager.update_session_activity(
+                    conv_session,
+                    session,
+                    interaction_type="command"
+                )
 
                 connected_platforms = lms_service.get_available_platforms()
                 platform_status = ", ".join(connected_platforms) if connected_platforms else "No LMS connected"
@@ -748,9 +760,10 @@ Choose a setting to modify:
         await update.message.reply_text(settings_text, reply_markup=reply_markup, parse_mode='Markdown')
     
     async def handle_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle general text queries - main AI interaction - with enhanced RAG"""
+        """Handle general text queries - main AI interaction - with enhanced RAG and session tracking"""
         user_data = update.effective_user
         query_text = update.message.text
+        start_time = datetime.now()
 
         try:
             # Show typing indicator
@@ -761,14 +774,25 @@ Choose a setting to modify:
                 user = self._get_or_create_user(session, user_data)
                 user_id = user.id
 
+                # Get or create conversation session
+                conv_session = session_manager.get_or_create_session(user_id, session)
+
+                # Update session activity
+                session_manager.update_session_activity(
+                    conv_session,
+                    session,
+                    interaction_type="question"
+                )
+
                 # Check if user has an active quiz session
                 active_quiz = session.query(QuizSession).filter(
                     QuizSession.user_id == user_id,
                     QuizSession.is_active == True
                 ).first()
 
-                # Cache quiz ID before session closes
+                # Cache quiz ID and session ID before session closes
                 active_quiz_id = active_quiz.id if active_quiz else None
+                current_session_id = conv_session.session_id
 
             # Detect quiz-related commands
             query_lower = query_text.lower()
@@ -859,8 +883,19 @@ Choose a setting to modify:
                     reply_markup=reply_markup
                 )
 
-                # Log interaction with enhanced metadata
-                self._log_rag_interaction(session, user.id, query_text, response_text)
+            # Calculate response time
+            response_time_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+
+            # Log interaction with personalization engine
+            personalization_engine.record_interaction(
+                user_id=user_id,
+                query=query_text,
+                response=response_text,
+                interaction_type="question",
+                response_time_ms=response_time_ms
+            )
+
+            logger.info(f"Session {current_session_id}: User {user_id} asked question (response time: {response_time_ms}ms)")
 
         except Exception as e:
             logger.error(f"Error in handle_query: {e}")
