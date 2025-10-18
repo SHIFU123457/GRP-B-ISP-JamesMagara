@@ -16,6 +16,7 @@ from collections import Counter
 import json
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import desc, and_, func
 
 from config.database import db_manager
@@ -152,6 +153,8 @@ class SessionManager:
                 current_context = conv_session.session_context or {}
                 current_context.update(context_updates)
                 conv_session.session_context = current_context
+                # Mark JSON field as modified for SQLAlchemy to track changes
+                flag_modified(conv_session, 'session_context')
 
             db_session.commit()
 
@@ -206,6 +209,72 @@ class SessionManager:
         except Exception as e:
             self.logger.error(f"Error cleaning up old sessions: {e}")
             return 0
+
+    def get_conversation_history(
+        self,
+        user_id: int,
+        db_session: Session,
+        limit: int = 5,
+        session_id: Optional[str] = None
+    ) -> List[Dict[str, str]]:
+        """
+        Get recent conversation history for context from current active session ONLY
+
+        Args:
+            user_id: User database ID
+            db_session: Database session
+            limit: Number of recent interactions to retrieve
+            session_id: Optional session ID to filter by (if not provided, uses active session)
+
+        Returns:
+            List of conversation turns with query and response
+        """
+        try:
+            # Get the active session to determine time boundary
+            if not session_id:
+                active_session = db_session.query(ConversationSession).filter(
+                    and_(
+                        ConversationSession.user_id == user_id,
+                        ConversationSession.is_active == True
+                    )
+                ).order_by(desc(ConversationSession.last_activity_at)).first()
+            else:
+                active_session = db_session.query(ConversationSession).filter(
+                    ConversationSession.session_id == session_id
+                ).first()
+
+            if not active_session:
+                self.logger.debug(f"No active session found for user {user_id}")
+                return []
+
+            # Only get interactions that occurred AFTER this session started
+            # This prevents pulling old conversation history from previous sessions
+            session_start_time = active_session.started_at.replace(tzinfo=None) if active_session.started_at else datetime.utcnow()
+
+            recent_interactions = db_session.query(UserInteraction).filter(
+                and_(
+                    UserInteraction.user_id == user_id,
+                    UserInteraction.created_at >= session_start_time
+                )
+            ).order_by(desc(UserInteraction.created_at)).limit(limit).all()
+
+            # Reverse to get chronological order (oldest to newest)
+            recent_interactions.reverse()
+
+            history = []
+            for interaction in recent_interactions:
+                history.append({
+                    'query': interaction.query_text,
+                    'response': interaction.response_text,
+                    'timestamp': interaction.created_at.isoformat() if interaction.created_at else None
+                })
+
+            self.logger.info(f"Retrieved {len(history)} conversation turns for user {user_id} from session {active_session.session_id} (started at {session_start_time})")
+            return history
+
+        except Exception as e:
+            self.logger.error(f"Error getting conversation history: {e}", exc_info=True)
+            return []
 
 
 class PersonalizationEngine:

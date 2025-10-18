@@ -585,12 +585,21 @@ STUDENT QUESTION: {query}
 
 ANSWER:"""
 
+                    # Get conversation history from session manager
+                    from src.services.personalization_engine import session_manager
+                    conversation_history = session_manager.get_conversation_history(
+                        user_id=user_id,
+                        db_session=session,
+                        limit=3  # Last 3 conversation turns
+                    )
+
                     # Enhance prompt with adaptive features
                     enhanced_prompt, metadata = adaptive_response_engine.analyze_and_enhance_prompt(
                         user_id=user_id,
                         query=query,
                         base_prompt=base_prompt,
-                        session=session
+                        session=session,
+                        conversation_history=conversation_history
                     )
 
                     logger.info(f"Adaptive response metadata: verbosity={metadata.get('verbosity_score'):.1f}/10, "
@@ -675,14 +684,22 @@ ANSWER:"""
         else:
             return 'low'
         
-    def generate_quiz_questions(self, user_id: int, document_id: Optional[int] = None, topic: Optional[str] = None, num_questions: int = 5) -> List[Dict[str, Any]]:
-        """Generate quiz questions from document or topic using RAG and LLM
+    def generate_quiz_questions(
+        self,
+        user_id: int,
+        document_id: Optional[int] = None,
+        topic: Optional[str] = None,
+        num_questions: int = 5,
+        conversation_history: Optional[List[Dict[str, str]]] = None
+    ) -> List[Dict[str, Any]]:
+        """Generate quiz questions from document, topic, or conversation using RAG and LLM
 
         Args:
             user_id: ID of the user requesting quiz questions (for document filtering)
             document_id: Optional specific document to generate questions from
             topic: Optional topic to search for and generate questions about
             num_questions: Number of questions to generate (default: 5)
+            conversation_history: Optional conversation history for context-based quizzes
 
         Returns list of question objects:
         [
@@ -696,8 +713,26 @@ ANSWER:"""
         ]
         """
         try:
-            # Retrieve relevant content
-            if document_id:
+            # If conversation history is provided, use it as primary context
+            if conversation_history:
+                logger.info(f"Generating quiz from conversation history ({len(conversation_history)} turns)")
+
+                # Build context from conversation
+                context_parts = []
+                for turn in conversation_history:
+                    context_parts.append(f"Q: {turn['query']}")
+                    context_parts.append(f"A: {turn['response'][:500]}")  # Truncate long responses
+
+                context = "\n\n".join(context_parts)
+                context_data = {
+                    'context': context,
+                    'has_relevant_content': True,
+                    'sources': [{'title': 'Conversation History'}]
+                }
+                source_description = f"conversation about '{topic}'"
+
+            # Retrieve relevant content from documents
+            elif document_id:
                 # Get content from specific document
                 # Use min_similarity=0 to get ALL chunks from the document regardless of semantic match
                 # This is important because quiz queries are meta-instructions, not content queries

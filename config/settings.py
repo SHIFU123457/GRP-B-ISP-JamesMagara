@@ -18,7 +18,7 @@ class Settings:
     MODEL_NAME: str = os.getenv("MODEL_NAME", "meta-llama/Llama-2-7b-chat-hf")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     VECTOR_STORE_PATH: str = os.getenv("VECTOR_STORE_PATH", "./data/vector_store")
-    MAX_CONTEXT_LENGTH: int = int(os.getenv("MAX_CONTEXT_LENGTH", "4096"))
+    MAX_CONTEXT_LENGTH: int = int(os.getenv("MAX_CONTEXT_LENGTH", "8192"))
     
     # LMS Settings
     MOODLE_BASE_URL: Optional[str] = os.getenv("MOODLE_BASE_URL")
@@ -43,9 +43,9 @@ class Settings:
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "75"))  # overlap words (increased)
     TOP_K_RETRIEVAL: int = int(os.getenv("TOP_K_RETRIEVAL", "20"))  # chunks to retrieve (increased for comprehensive responses)
     SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.25"))  # minimum similarity (lowered for better recall)
-    CONTEXT_MAX_LENGTH: int = int(os.getenv("CONTEXT_MAX_LENGTH", "4000"))  # max context length for LLM (increased)
+    CONTEXT_MAX_LENGTH: int = int(os.getenv("CONTEXT_MAX_LENGTH", "8000"))  # max context length for LLM (increased)
     HIGH_QUALITY_THRESHOLD: float = float(os.getenv("HIGH_QUALITY_THRESHOLD", "0.3"))  # threshold for quality filtering
-    MAX_RESPONSE_LENGTH: int = int(os.getenv("MAX_RESPONSE_LENGTH", "4000"))  # max LLM response length in characters
+    MAX_RESPONSE_LENGTH: int = int(os.getenv("MAX_RESPONSE_LENGTH", "8000"))  # max LLM response length in characters
 
     # Document Processing Settings
     SUPPORTED_FILE_TYPES: list = ["pdf", "docx", "txt", "doc", "pptx", "ppt"]

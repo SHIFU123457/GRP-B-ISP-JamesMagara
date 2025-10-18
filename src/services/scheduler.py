@@ -172,6 +172,9 @@ class SchedulerService:
         sync_interval = getattr(settings, 'LMS_SYNC_INTERVAL_MINUTES', 720)
         schedule.every(sync_interval).minutes.do(self._sync_lms_content)
 
+        # Schedule learning style reclassification every 12 hours (aligned with LMS sync)
+        schedule.every(12).hours.do(self._reclassify_learning_styles)
+
         # Schedule document processing every 3 minutes
         schedule.every(3).minutes.do(self._process_pending_documents)
 
@@ -181,7 +184,7 @@ class SchedulerService:
         # Schedule weekly full sync every Sunday at 3 AM
         schedule.every().sunday.at("03:00").do(self._weekly_full_sync)
 
-        logger.info(f"Scheduled tasks configured - Gmail check every 2 min, LMS sync every {sync_interval} hrs")
+        logger.info(f"Scheduled tasks configured - Gmail check every 2 min, LMS sync & style reclassification every 12 hrs")
     
     def _run_scheduler(self):
         """Run the scheduler loop"""
@@ -626,21 +629,102 @@ class SchedulerService:
         """Perform weekly full synchronization"""
         try:
             logger.info("Starting weekly full sync...")
-            
+
             # Force a complete sync of all LMS content
             stats = lms_service.sync_all_materials()
-            
+
             # Get RAG pipeline statistics
             if self.rag_pipeline:
                 rag_stats = self.rag_pipeline.get_vector_store_stats()
                 logger.info(f"Vector store stats: {rag_stats}")
-            
+
             # Log sync summary
             logger.info(f"Weekly sync completed - Courses: {stats['courses_synced']}, Documents: {stats['documents_synced']}")
-            
+
         except Exception as e:
             logger.error(f"Error during weekly full sync: {e}")
-    
+
+    def _reclassify_learning_styles(self):
+        """
+        Reclassify learning styles for all active users (runs every 12 hours)
+
+        This task analyzes each user's last 30 interactions and updates their
+        learning style based on detected patterns in their queries.
+        """
+        try:
+            logger.info("🎓 Starting scheduled learning style reclassification...")
+
+            from src.data.models import UserInteraction
+            from src.services.explanation_style_engine import explanation_style_engine
+
+            with db_manager.get_session() as session:
+                # Get all users who have interacted in the last 30 days
+                cutoff_date = datetime.now() - timedelta(days=30)
+
+                # Query users with recent interactions
+                active_user_ids = session.query(UserInteraction.user_id).filter(
+                    UserInteraction.created_at >= cutoff_date
+                ).distinct().all()
+
+                active_user_ids = [uid[0] for uid in active_user_ids]  # Extract IDs from tuples
+
+                if not active_user_ids:
+                    logger.info("No active users found for reclassification")
+                    return
+
+                logger.info(f"Reclassifying learning styles for {len(active_user_ids)} active users...")
+
+                reclassified_count = 0
+                style_changes = []
+
+                for user_id in active_user_ids:
+                    try:
+                        # Get user
+                        user = session.query(User).filter(User.id == user_id).first()
+                        if not user:
+                            continue
+
+                        old_style = user.learning_style
+
+                        # Force reclassification
+                        new_style, scores = explanation_style_engine.get_user_learning_style(
+                            user_id, session, force_reclassify=True
+                        )
+
+                        reclassified_count += 1
+
+                        # Log style changes
+                        if old_style != new_style:
+                            style_changes.append({
+                                'user_id': user_id,
+                                'old_style': old_style,
+                                'new_style': new_style,
+                                'scores': scores
+                            })
+                            logger.info(f"📊 User {user_id} style changed: {old_style} → {new_style}")
+
+                    except Exception as e:
+                        logger.error(f"Error reclassifying user {user_id}: {e}")
+                        continue
+
+                # Log summary
+                logger.info(
+                    f"✅ Learning style reclassification completed: "
+                    f"{reclassified_count} users processed, "
+                    f"{len(style_changes)} style changes detected"
+                )
+
+                if style_changes:
+                    # Log detailed changes
+                    for change in style_changes[:10]:  # Show first 10 changes
+                        logger.debug(
+                            f"  User {change['user_id']}: {change['old_style']} → {change['new_style']} "
+                            f"(scores: {change['scores']})"
+                        )
+
+        except Exception as e:
+            logger.error(f"❌ Error in learning style reclassification task: {e}", exc_info=True)
+
     def force_sync_now(self) -> Dict[str, Any]:
         """Force an immediate sync (useful for testing or manual triggers)"""
         try:

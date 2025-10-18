@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from typing import Any, Dict, Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -13,6 +13,8 @@ from telegram.ext import (
     filters
 )
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy import and_, desc
 
 from src.data.models import User, UserInteraction, PersonalizationProfile, QuizSession, ConversationSession
 from config.database import db_manager
@@ -185,6 +187,7 @@ class StudyHelperBot:
         """Add all command and message handlers"""
         # Command handlers
         self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("new_session", self.new_session_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("profile", self.profile_command))
         self.application.add_handler(CommandHandler("courses", self.courses_command))
@@ -244,9 +247,12 @@ I'm your AI-powered academic assistant. I can help you with:
 To get started:
 1. Use /courses to see available courses
 2. Ask me questions about your studies
-3. Use /help for more commands
+3. Use /new_session to start discussing a new topic
+4. Use /help for more commands
 
 Example: "What are the main topics in today's lecture notes?"
+
+💡 **Tip:** I remember our conversation context! Use `/new_session` when switching to a completely different topic.
                 """.strip()
 
                 keyboard = [
@@ -274,7 +280,72 @@ Example: "What are the main topics in today's lecture notes?"
             await update.message.reply_text(
                 "Sorry, I encountered an error. Please try again later."
             )
-    
+
+    async def new_session_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /new_session command to start a fresh conversation session"""
+        user_data = update.effective_user
+
+        try:
+            with db_manager.get_session() as session:
+                user = self._get_or_create_user(session, user_data)
+                user_id = user.id
+
+                # Get current active session
+                current_session = session.query(ConversationSession).filter(
+                    and_(
+                        ConversationSession.user_id == user_id,
+                        ConversationSession.is_active == True
+                    )
+                ).order_by(desc(ConversationSession.last_activity_at)).first()
+
+                # Store info about the old session
+                old_session_info = None
+                if current_session:
+                    old_session_info = {
+                        'primary_topic': current_session.primary_topic,
+                        'message_count': current_session.message_count,
+                        'duration': (datetime.now(timezone.utc) - current_session.started_at.replace(tzinfo=None)).total_seconds() / 60
+                    }
+
+                    # Force close the current session
+                    session_manager.force_close_session(current_session.session_id)
+                    logger.info(f"User {user_id} manually closed session {current_session.session_id}")
+
+                # Create a new session
+                new_session = session_manager.get_or_create_session(user_id, session)
+
+                # Prepare response message
+                if old_session_info:
+                    response_text = f"""🔄 **New Session Started**
+
+📝 Previous session summary:
+• Topic: {old_session_info['primary_topic'] or 'General discussion'}
+• Messages: {old_session_info['message_count']}
+• Duration: {old_session_info['duration']:.1f} minutes
+
+✨ You can now start discussing a new topic with a fresh context. The bot won't reference the previous conversation.
+
+💡 **Tip:** Sessions automatically reset after 30 minutes of inactivity, or you can use `/new_session` anytime to start fresh!
+                    """.strip()
+                else:
+                    response_text = f"""🔄 **New Session Started**
+
+✨ You can now start discussing a new topic with a fresh context.
+
+💡 **Tip:** Sessions automatically reset after 30 minutes of inactivity, or you can use `/new_session` anytime to start fresh!
+                    """.strip()
+
+                await update.message.reply_text(response_text, parse_mode='Markdown')
+
+                # Log the interaction
+                self._log_interaction(session, user_id, "/new_session", response_text, "command")
+
+        except Exception as e:
+            logger.error(f"Error in new_session_command: {e}", exc_info=True)
+            await update.message.reply_text(
+                "Sorry, I encountered an error while creating a new session. Please try again later."
+            )
+
     async def sync_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /sync command for manual synchronization"""
         try:
@@ -394,6 +465,7 @@ Please check the system status or try again later.
 
 **Basic Commands:**
 /start - Initialize the bot and see welcome message
+/new\\_session - Start a fresh conversation (clear context)
 /help - Show this help message
 /profile - View your learning profile
 /courses - View enrolled courses
@@ -417,12 +489,19 @@ Please check the system status or try again later.
 📊 **Get Summaries**: Request summaries of materials
    Example: "Summarize today's lecture on algorithms"
 
+🔄 **Switch Topics**: Use /new\\_session when changing subjects
+   Example: After discussing Python, use /new\\_session before asking about Math
+
 **Tips for Better Results:**
 • Be specific about which course or topic
 • Ask follow-up questions for clarification
+• Use /new\\_session when switching to a different topic
 • Rate my responses to improve personalization
 • Use /sync to get the latest materials
 • Use /settings to customize your experience
+
+**About Context Memory:**
+💡 I remember our conversation within a session (30 minutes or until you use /new\\_session). This helps me understand follow-up questions like "explain it with code" or "show me another example."
 
 **Getting Started:**
 1. Use /connect\\_classroom to link your Google account
@@ -841,8 +920,60 @@ Choose a setting to modify:
             if is_quiz_request:
                 # Extract topic from query
                 topic = self._extract_quiz_topic(query_text)
+
+                # Check if topic refers to current conversation
                 if topic:
-                    await self._initiate_quiz_from_topic(update.effective_chat.id, user_id, topic)
+                    conversation_references = [
+                        'what we discussed', 'what we have discussed', 'what we talked about',
+                        'what we have been discussing', 'our conversation', 'this topic',
+                        'what we covered', 'what you explained', 'what we ve been talking about',
+                        'the current topic', 'this session', 'what i asked about', 'thus far'
+                    ]
+
+                    # Check if the topic is a reference to the conversation
+                    topic_lower = topic.lower()
+                    is_conversation_reference = any(ref in topic_lower for ref in conversation_references)
+
+                    if is_conversation_reference:
+                        # Get conversation history to determine actual topic
+                        with db_manager.get_session() as session:
+                            conv_session = session_manager.get_or_create_session(user_id, session)
+                            conversation_history = session_manager.get_conversation_history(user_id, session, limit=5)
+
+                            # Get topics from session context
+                            session_context = conv_session.session_context or {}
+                            primary_topic = conv_session.primary_topic
+                            all_topics = session_context.get('all_topics', [])
+
+                            if primary_topic:
+                                # Use the primary topic from session
+                                actual_topic = primary_topic
+                                logger.info(f"Quiz request refers to conversation - using session topic: {actual_topic}")
+                            elif all_topics:
+                                # Use the first topic found
+                                actual_topic = all_topics[0]
+                                logger.info(f"Quiz request refers to conversation - using first topic: {actual_topic}")
+                            elif conversation_history:
+                                # Fallback: Use the most recent query as context
+                                actual_topic = conversation_history[-1]['query'][:100]  # Last user query
+                                logger.info(f"Quiz request refers to conversation - using recent query: {actual_topic}")
+                            else:
+                                await update.message.reply_text(
+                                    "❌ I don't have enough conversation context to generate a quiz.\n"
+                                    "Please specify a topic explicitly, e.g., 'Quiz me on machine learning'"
+                                )
+                                return
+
+                        # Pass conversation history to quiz generation for context
+                        await self._initiate_quiz_from_topic(
+                            update.effective_chat.id,
+                            user_id,
+                            actual_topic,
+                            conversation_history=conversation_history
+                        )
+                    else:
+                        # Normal topic-based quiz
+                        await self._initiate_quiz_from_topic(update.effective_chat.id, user_id, topic)
                 else:
                     await update.message.reply_text(
                         "Please specify a topic you'd like to be quizzed on.\n"
@@ -859,7 +990,7 @@ Choose a setting to modify:
 
                 # Send response (split if too long for Telegram)
                 # Temporarily disable Markdown to fix parsing errors
-                if len(response_text) > 4096:  # Telegram message limit
+                if len(response_text) > 8192:  # Telegram message limit
                     # Split at natural break points
                     parts = self._split_long_message(response_text)
                     for i, part in enumerate(parts):
@@ -886,6 +1017,49 @@ Choose a setting to modify:
             # Calculate response time
             response_time_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
+            # Update session context with current topic and course
+            with db_manager.get_session() as session:
+                conv_session = session_manager.get_or_create_session(user_id, session)
+                user_obj = session.query(User).filter(User.id == user_id).first()
+
+                # Extract topic from query using adaptive_response_engine's topic analyzer
+                from src.services.adaptive_response_engine import adaptive_response_engine
+                topics = adaptive_response_engine.topic_analyzer.extract_topics(query_text)
+
+                # Extract course context
+                course_id = self._extract_course_context(query_text, user_obj)
+
+                # Update session context with current topic
+                context_updates = {}
+                if topics:
+                    context_updates['current_topic'] = topics[0]  # Primary topic
+                    context_updates['all_topics'] = topics
+                    # Track primary topic for session
+                    if not conv_session.primary_topic:
+                        conv_session.primary_topic = topics[0]
+
+                # Update courses_discussed list
+                if course_id:
+                    course = session.query(Course).filter(Course.id == course_id).first()
+                    if course:
+                        context_updates['current_course'] = course.course_name
+                        # Add to courses_discussed if not already there
+                        courses_discussed = conv_session.courses_discussed or []
+                        if course_id not in courses_discussed:
+                            courses_discussed.append(course_id)
+                            conv_session.courses_discussed = courses_discussed
+                            flag_modified(conv_session, 'courses_discussed')
+
+                session.commit()
+
+                # Update session activity with context
+                session_manager.update_session_activity(
+                    conv_session,
+                    session,
+                    interaction_type="question",
+                    context_updates=context_updates
+                )
+
             # Log interaction with personalization engine
             personalization_engine.record_interaction(
                 user_id=user_id,
@@ -902,7 +1076,7 @@ Choose a setting to modify:
             await update.message.reply_text(
                 "Sorry, I encountered an error processing your question. Please try again."
             )
-    def _split_long_message(self, text: str, max_length: int = 4000) -> list:
+    def _split_long_message(self, text: str, max_length: int = 8000) -> list:
         """Split long messages at natural break points"""
         if len(text) <= max_length:
             return [text]
@@ -1074,6 +1248,10 @@ Choose a setting to modify:
 
             elif callback_data.startswith("quiz_end_"):
                 await self._handle_quiz_end(update, context, callback_data)
+
+            # Handle learning style preference changes
+            elif callback_data.startswith("set_"):
+                await self._handle_preference_change(update, context, callback_data)
 
             else:
                 await query.edit_message_text("Feature coming soon! Though sifai kujibu hivi mkuu. \n\n Kwa handle_callback")
@@ -1682,30 +1860,133 @@ Use /help for available commands!
         except Exception as e:
             logger.error(f"Error handling feedback: {e}")
             await query.edit_message_text("Thanks for the feedback!")
-    
+
+    async def _handle_preference_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
+        """Handle user preference changes (learning style and difficulty)"""
+        query = update.callback_query
+        user_data = query.from_user
+
+        try:
+            # Parse the preference being changed
+            preference_value = callback_data.replace("set_", "")
+
+            # Learning style preferences (using actual engine values)
+            learning_styles = {
+                "example_driven": "Example-Driven",
+                "analogy_driven": "Analogy-Driven",
+                "socratic": "Socratic",
+                "theory_first": "Theory-First",
+                "adaptive": "Adaptive"
+            }
+
+            # Difficulty preferences
+            difficulty_levels = {
+                "easy": "Easy",
+                "medium": "Medium",
+                "hard": "Hard"
+            }
+
+            with db_manager.get_session() as session:
+                user = session.query(User).filter(User.telegram_id == str(user_data.id)).first()
+
+                if not user:
+                    await query.edit_message_text("❌ User not found. Please use /start first.")
+                    return
+
+                # Handle learning style change
+                if preference_value in learning_styles:
+                    old_style = user.learning_style
+                    user.learning_style = preference_value
+
+                    # Reset the classification timestamp so the 12-hour timer starts from now
+                    user.last_style_classification = datetime.now(timezone.utc)
+
+                    session.commit()
+
+                    style_name = learning_styles[preference_value]
+
+                    # Get style description
+                    style_descriptions = {
+                        "example_driven": "You'll learn through concrete examples first, followed by theory.",
+                        "analogy_driven": "You'll learn through metaphors and real-world comparisons.",
+                        "socratic": "You'll learn through guided questions and discovery.",
+                        "theory_first": "You'll learn formal definitions and theory before examples.",
+                        "adaptive": "I'll automatically detect and adapt to your learning style based on your questions."
+                    }
+
+                    description = style_descriptions.get(preference_value, "")
+
+                    await query.edit_message_text(
+                        f"✅ **Learning Style Updated!**\n\n"
+                        f"Your learning style has been set to: **{style_name}**\n\n"
+                        f"{description}\n\n"
+                        f"Note: The system will automatically re-evaluate your learning style every 12 hours based on your interactions.\n\n"
+                        f"You can change this anytime using /settings",
+                        parse_mode='Markdown'
+                    )
+
+                    logger.info(f"User {user.id} changed learning style from '{old_style}' to '{preference_value}' (timestamp reset)")
+
+                # Handle difficulty change
+                elif preference_value in difficulty_levels:
+                    old_difficulty = user.difficulty_preference
+                    user.difficulty_preference = preference_value
+                    session.commit()
+
+                    difficulty_name = difficulty_levels[preference_value]
+
+                    difficulty_descriptions = {
+                        "easy": "Simple explanations with basic examples",
+                        "medium": "Balanced detail with practical examples",
+                        "hard": "Comprehensive explanations with advanced concepts"
+                    }
+
+                    description = difficulty_descriptions.get(preference_value, "")
+
+                    await query.edit_message_text(
+                        f"✅ **Difficulty Level Updated!**\n\n"
+                        f"Your difficulty level has been set to: **{difficulty_name}**\n\n"
+                        f"{description}\n\n"
+                        f"You can change this anytime using /settings",
+                        parse_mode='Markdown'
+                    )
+
+                    logger.info(f"User {user.id} changed difficulty from '{old_difficulty}' to '{preference_value}'")
+
+                else:
+                    await query.edit_message_text("❌ Invalid preference option.")
+
+        except Exception as e:
+            logger.error(f"Error handling preference change: {e}", exc_info=True)
+            await query.edit_message_text("❌ Failed to update preference. Please try again.")
+
     async def _handle_setting_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
         """Handle settings changes"""
         query = update.callback_query
         setting_type = callback_data.replace("setting_", "")
-        
+
         if setting_type == "learning_style":
             keyboard = [
                 [
-                    InlineKeyboardButton("👁️ Visual", callback_data="set_visual"),
-                    InlineKeyboardButton("👂 Auditory", callback_data="set_auditory")
+                    InlineKeyboardButton("📝 Example-Driven", callback_data="set_example_driven"),
+                    InlineKeyboardButton("🔍 Analogy-Driven", callback_data="set_analogy_driven")
                 ],
                 [
-                    InlineKeyboardButton("✋ Kinesthetic", callback_data="set_kinesthetic"),
+                    InlineKeyboardButton("❓ Socratic", callback_data="set_socratic"),
+                    InlineKeyboardButton("📚 Theory-First", callback_data="set_theory_first")
+                ],
+                [
                     InlineKeyboardButton("🧠 Adaptive", callback_data="set_adaptive")
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
                 "📖 **Choose Your Learning Style:**\n\n"
-                "• **Visual**: Learn better with diagrams and visual aids\n"
-                "• **Auditory**: Prefer verbal explanations\n" 
-                "• **Kinesthetic**: Learn by doing and examples\n"
-                "• **Adaptive**: Let me adapt to your preferences automatically",
+                "• **Example-Driven**: Learn with concrete examples first, then theory\n"
+                "• **Analogy-Driven**: Learn through metaphors and real-world comparisons\n"
+                "• **Socratic**: Learn through guided questions and discovery\n"
+                "• **Theory-First**: Learn formal definitions before examples\n"
+                "• **Adaptive**: Let me automatically adapt to your preferences",
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
@@ -1929,14 +2210,33 @@ Use /help for available commands!
             logger.error(f"❌ Error initiating quiz from document: {e}")
             await query.edit_message_text("❌ Sorry, failed to start the quiz. Please try again.")
 
-    async def _initiate_quiz_from_topic(self, chat_id: int, user_id: int, topic: str):
-        """Initiate a quiz session from a topic search"""
+    async def _initiate_quiz_from_topic(
+        self,
+        chat_id: int,
+        user_id: int,
+        topic: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None
+    ):
+        """Initiate a quiz session from a topic search
+
+        Args:
+            chat_id: Telegram chat ID
+            user_id: User database ID
+            topic: Topic to generate quiz about
+            conversation_history: Optional conversation history for context-based quizzes
+        """
         try:
             # Send initial message
-            msg = await self.application.bot.send_message(
-                chat_id=chat_id,
-                text=f"🧠 Generating quiz questions about '{topic}'... Please wait."
-            )
+            if conversation_history:
+                msg = await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🧠 Generating quiz questions about our conversation on '{topic}'... Please wait."
+                )
+            else:
+                msg = await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🧠 Generating quiz questions about '{topic}'... Please wait."
+                )
 
             # Check if user already has an active quiz
             with db_manager.get_session() as session:
@@ -1952,7 +2252,13 @@ Use /help for available commands!
                     return
 
             # Generate questions using RAG pipeline
-            questions = self.rag_pipeline.generate_quiz_questions(user_id=user_id, topic=topic, num_questions=5)
+            # If conversation_history is provided, use it as additional context
+            questions = self.rag_pipeline.generate_quiz_questions(
+                user_id=user_id,
+                topic=topic,
+                num_questions=5,
+                conversation_history=conversation_history
+            )
 
             if not questions:
                 await msg.edit_text(

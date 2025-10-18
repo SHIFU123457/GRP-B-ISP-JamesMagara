@@ -14,7 +14,7 @@ into learning style clusters.
 import logging
 import re
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import Counter
 
 from sqlalchemy import desc, and_
@@ -72,12 +72,14 @@ class LearningStyleClassifier:
         r'\bstep\s+by\s+step\b',
         r'\bwhat\s+happens\s+when\b',
         r'\bcan\s+you\s+ask\b',
-        r'\bquestion\s+me\b'
+        r'\bquestion\s+me\b',
+        r'\bhow\s+would\b'
     ]
 
     THEORY_FIRST_PATTERNS = [
         r'\bdefine\b',
-        r'\bwhat\s+is\s+the\s+definition\b',
+        r'\b(what\s*is|what\'s)\s+the\s+definition\b',
+        r'\bformal\s+definition\b',
         r'\bformally\b',
         r'\btheory\b',
         r'\bprinciple\b',
@@ -382,6 +384,25 @@ INSTRUCTIONS FOR EXPLAINING {topic.upper()}:
 
 User Level: {user_level.title()}"""
 
+    def generate_prompt_template(
+        self,
+        learning_style: str,
+        topic: str = "the concept",
+        user_level: str = "intermediate"
+    ) -> str:
+        """
+        Alias for generate_style_instructions for backward compatibility
+
+        Args:
+            learning_style: example_driven, analogy_driven, socratic, theory_first
+            topic: The topic being explained
+            user_level: beginner/intermediate/advanced
+
+        Returns:
+            Style-specific instructions for LLM
+        """
+        return self.generate_style_instructions(learning_style, topic, user_level)
+
 
 class ExplanationStyleEngine:
     """Main engine for managing explanation style customization"""
@@ -398,51 +419,82 @@ class ExplanationStyleEngine:
         force_reclassify: bool = False
     ) -> Tuple[str, Dict[str, float]]:
         """
-        Get user's learning style, using cached value if available
+        Get user's learning style with time-based reclassification
+
+        Classification occurs when:
+        - force_reclassify=True
+        - User has never been classified (last_style_classification is None)
+        - 12+ hours have passed since last classification
 
         Args:
             user_id: User database ID
             session: Database session
-            force_reclassify: Force re-classification even if cached
+            force_reclassify: Force re-classification regardless of time
 
         Returns:
             Tuple of (primary_style, style_scores)
         """
         try:
-            # Check profile for cached style
-            profile = session.query(PersonalizationProfile).filter(
-                PersonalizationProfile.user_id == user_id
-            ).first()
-
             user = session.query(User).filter(User.id == user_id).first()
 
-            # Use cached style if available and not forcing reclassify
-            if not force_reclassify and user and user.learning_style != 'adaptive':
-                cached_style = user.learning_style
+            if not user:
+                self.logger.warning(f"User {user_id} not found")
+                return 'adaptive', {
+                    'example_driven': 0.25,
+                    'analogy_driven': 0.25,
+                    'socratic': 0.25,
+                    'theory_first': 0.25
+                }
 
-                # Get or estimate scores
+            # Determine if reclassification is needed
+            now_utc = datetime.now(timezone.utc)
+            needs_reclassification = (
+                force_reclassify
+                or user.last_style_classification is None
+                or (now_utc - user.last_style_classification) >= timedelta(hours=12)
+            )
+
+            if needs_reclassification:
+                # Reclassify from last 30 interactions
+                self.logger.info(f"Reclassifying learning style for user {user_id}...")
+                primary_style, scores = self.classifier.classify_user_style(user_id, session)
+
+                # Update database with new style and timestamp
+                self._update_style_in_profile(user_id, primary_style, scores, session)
+                user.last_style_classification = now_utc
+                session.commit()
+
+                self.logger.info(f"User {user_id} reclassified as {primary_style}")
+                return primary_style, scores
+            else:
+                # Use existing database value (not older than 12 hours)
+                time_since_classification = now_utc - user.last_style_classification
+                hours_since = time_since_classification.total_seconds() / 3600
+
+                self.logger.debug(
+                    f"Using existing style for user {user_id}: {user.learning_style} "
+                    f"(classified {hours_since:.1f}h ago)"
+                )
+
+                # Get stored scores from profile
+                profile = session.query(PersonalizationProfile).filter(
+                    PersonalizationProfile.user_id == user_id
+                ).first()
+
                 if profile and profile.feature_vector and 'style_scores' in profile.feature_vector:
                     scores = profile.feature_vector['style_scores']
                 else:
-                    # Estimate scores based on cached style
+                    # Estimate scores based on current style
                     scores = {
                         'example_driven': 0.25,
                         'analogy_driven': 0.25,
                         'socratic': 0.25,
                         'theory_first': 0.25
                     }
-                    scores[cached_style] = 0.7
+                    if user.learning_style != 'adaptive':
+                        scores[user.learning_style] = 0.7
 
-                self.logger.debug(f"Using cached style for user {user_id}: {cached_style}")
-                return cached_style, scores
-
-            # Classify based on interaction history
-            primary_style, scores = self.classifier.classify_user_style(user_id, session)
-
-            # Update profile with new style
-            self._update_style_in_profile(user_id, primary_style, scores, session)
-
-            return primary_style, scores
+                return user.learning_style, scores
 
         except Exception as e:
             self.logger.error(f"Error getting user learning style: {e}", exc_info=True)
@@ -513,13 +565,14 @@ class ExplanationStyleEngine:
             query_style_scores = self.classifier.analyze_query_style(query)
             max_query_score = max(query_style_scores.values())
 
-            # If query strongly indicates a style (>0.3), consider temporary override
-            if max_query_score > 0.3:
+            # If query strongly indicates a style (>0.2), consider temporary override
+            if max_query_score > 0.2:
                 query_suggested_style = max(query_style_scores, key=query_style_scores.get)
                 self.logger.debug(f"Query suggests {query_suggested_style} style (score: {max_query_score:.2f})")
 
                 # Use query style if significantly different from user's primary style
-                if query_suggested_style != primary_style and max_query_score > 0.4:
+                # Lower threshold to 0.3 for override to be more responsive to query intent
+                if query_suggested_style != primary_style and max_query_score > 0.3:
                     style_to_use = query_suggested_style
                     self.logger.info(f"Overriding user style {primary_style} with query style {query_suggested_style}")
                 else:

@@ -19,9 +19,10 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     
     # Learning preferences (will be updated by personalization engine)
-    learning_style = Column(String, default="adaptive")  # visual, auditory, kinesthetic, adaptive
+    learning_style = Column(String, default="adaptive")  # example_driven, analogy_driven, socratic, theory_first, adaptive
     difficulty_preference = Column(String, default="medium")  # easy, medium, hard
     interaction_frequency = Column(Float, default=0.0)  # interactions per day
+    last_style_classification = Column(DateTime(timezone=True))  # When learning style was last classified
 
     # OAuth credentials (encrypted JSON)
     google_credentials = Column(Text)  # Store encrypted Google OAuth credentials

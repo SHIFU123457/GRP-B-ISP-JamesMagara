@@ -126,32 +126,152 @@ class TopicBridgeAnalyzer:
 
     def __init__(self):
         self.logger = logging.getLogger(f"{__name__}.TopicBridgeAnalyzer")
+        self._llm_service = None  # Lazy load to avoid circular imports
+
+    @property
+    def llm_service(self):
+        """Lazy load LLM service to avoid circular imports"""
+        if self._llm_service is None:
+            from src.services.llm_integration import LLMService
+            self._llm_service = LLMService()
+        return self._llm_service
 
     def extract_topics(self, query: str) -> List[str]:
         """
-        Extract key topics from query
-        Simple keyword-based extraction (can be enhanced with NER later)
+        Extract key topics from query using LLM-based analysis
+
+        This method uses an LLM to intelligently identify the main topics/concepts
+        being discussed in the user's query, regardless of specific keywords.
+
+        Args:
+            query: User's query text
+
+        Returns:
+            List of identified topics (e.g., ['regression', 'machine learning'])
         """
-        # Common CS topics (extendable)
-        topic_keywords = {
-            'recursion': ['recursion', 'recursive'],
-            'sorting': ['sort', 'sorting', 'quicksort', 'mergesort', 'bubble sort'],
-            'data structures': ['stack', 'queue', 'linked list', 'tree', 'graph', 'heap'],
-            'algorithms': ['algorithm', 'complexity', 'big o', 'time complexity'],
-            'object oriented': ['oop', 'class', 'object', 'inheritance', 'polymorphism'],
-            'databases': ['database', 'sql', 'query', 'table', 'join'],
-            'python': ['python', 'list', 'dictionary', 'tuple'],
-            'arrays': ['array', 'list', 'index'],
-        }
+        try:
+            # Use LLM to extract topics with a simpler, more direct prompt
+            prompt = f"""Extract the main academic topics from this question. List 1-3 topics, one per line.
 
+Question: {query}
+
+Topics:"""
+
+            # Get LLM response
+            llm_response = self.llm_service.generate_response(
+                query="Extract topics",
+                context=prompt,
+                user_preferences=None
+            )
+
+            # Log the raw response for debugging
+            self.logger.debug(f"Raw LLM response for topic extraction: {llm_response[:200]}...")
+
+            # Parse the response to extract topic names
+            # Strategy 1: Try to extract from structured format first
+            topics = []
+            lines = llm_response.strip().split('\n')
+
+            # First, try to find lines that look like clean topic names
+            for line in lines:
+                line = line.strip()
+
+                # Skip empty lines
+                if not line or len(line) < 2:
+                    continue
+
+                # Remove common prefixes (numbers, bullets, dashes, "Topics:")
+                cleaned = re.sub(r'^[-\*\d\.]+\s*', '', line)
+                cleaned = re.sub(r'^topics?[\s:]*', '', cleaned, flags=re.IGNORECASE)
+                cleaned = re.sub(r'^here are.*?:\s*', '', cleaned, flags=re.IGNORECASE)
+                cleaned = cleaned.strip()
+
+                # Skip if it's too long (likely a sentence, not a topic)
+                if len(cleaned) > 40:
+                    continue
+
+                # Skip if it ends with punctuation (likely a sentence)
+                if cleaned.endswith(('.', '?', '!')):
+                    continue
+
+                # Skip if it contains colon in the middle (likely a header)
+                if ':' in cleaned and cleaned.index(':') < len(cleaned) // 2:
+                    continue
+
+                # Accept if it looks like a reasonable topic (mostly alphanumeric + spaces)
+                if cleaned:
+                    alpha_count = sum(c.isalnum() or c.isspace() or c == '-' for c in cleaned)
+                    if alpha_count / len(cleaned) >= 0.7:  # At least 70% valid characters
+                        topics.append(cleaned.lower())
+
+            # Strategy 2: If no topics found, try to extract keywords from the full response
+            if not topics:
+                self.logger.debug("Strategy 1 failed, trying keyword extraction from full response")
+                # Look for phrases after "topics", "topic:", "about", etc.
+                patterns = [
+                    r'topics?[\s:]+(.+?)(?:\.|$)',
+                    r'(?:about|discussing|regarding)[\s:]+(.+?)(?:\.|$)',
+                    r'main\s+(?:topic|concept|subject)[\s:]+(.+?)(?:\.|$)',
+                ]
+
+                for pattern in patterns:
+                    matches = re.findall(pattern, llm_response, re.IGNORECASE)
+                    for match in matches:
+                        # Split by commas or "and"
+                        parts = re.split(r',|\sand\s', match)
+                        for part in parts:
+                            part = part.strip()
+                            if 2 <= len(part) <= 30:
+                                topics.append(part.lower())
+
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_topics = []
+            for topic in topics:
+                topic = topic.strip()
+                if topic and topic not in seen and len(topic) >= 2:
+                    seen.add(topic)
+                    unique_topics.append(topic)
+
+            # Limit to top 3 topics
+            topics = unique_topics[:3]
+
+            if topics:
+                self.logger.info(f"LLM extracted topics from '{query[:50]}...': {topics}")
+                return topics
+            else:
+                self.logger.warning(f"LLM returned no parseable topics for query: {query[:50]}...")
+                self.logger.debug(f"Full LLM response: {llm_response}")
+                # Fallback to simple extraction
+                return self._fallback_topic_extraction(query)
+
+        except Exception as e:
+            self.logger.warning(f"Error in LLM topic extraction: {e}. Using fallback method.")
+            return self._fallback_topic_extraction(query)
+
+    def _fallback_topic_extraction(self, query: str) -> List[str]:
+        """Simple fallback method when LLM is unavailable"""
         query_lower = query.lower()
-        detected_topics = []
 
-        for topic, keywords in topic_keywords.items():
-            if any(kw in query_lower for kw in keywords):
-                detected_topics.append(topic)
+        # Remove common question words and stopwords
+        question_words = {'what', 'when', 'where', 'who', 'why', 'how', 'is', 'are', 'can',
+                         'could', 'would', 'should', 'do', 'does', 'did', 'explain', 'tell', 'me'}
+        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+                    'of', 'with', 'by', 'from', 'about', 'as', 'into', 'like', 'through'}
 
-        return detected_topics
+        # Extract significant words (longer than 3 chars, not stopwords)
+        words = query_lower.split()
+        significant_words = [
+            word.strip('?.,!;:')
+            for word in words
+            if len(word) > 3
+            and word not in question_words
+            and word not in stopwords
+            and word.isalpha()
+        ]
+
+        # Return up to 3 significant words as topics
+        return significant_words[:3] if significant_words else ['general']
 
     def get_struggle_topics(self, user_id: int, session: Session, lookback_days: int = 14) -> List[Dict[str, Any]]:
         """
@@ -379,7 +499,8 @@ class AdaptiveResponseEngine:
         user_id: int,
         query: str,
         base_prompt: str,
-        session: Session
+        session: Session,
+        conversation_history: Optional[List[Dict[str, str]]] = None
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Analyze query and enhance prompt with personalization
@@ -389,6 +510,7 @@ class AdaptiveResponseEngine:
             query: User's query text
             base_prompt: Original prompt for LLM
             session: Database session
+            conversation_history: Recent conversation turns for context
 
         Returns:
             Tuple of (enhanced_prompt, analysis_metadata)
@@ -443,7 +565,8 @@ class AdaptiveResponseEngine:
                 user_level=user_level,
                 learning_style=learning_style,
                 profile=profile,
-                style_instructions=style_instructions
+                style_instructions=style_instructions,
+                conversation_history=conversation_history
             )
 
             # Metadata for logging
@@ -474,9 +597,21 @@ class AdaptiveResponseEngine:
         user_level: str,
         learning_style: str,
         profile: Optional[PersonalizationProfile],
-        style_instructions: str = ""
+        style_instructions: str = "",
+        conversation_history: Optional[List[Dict[str, str]]] = None
     ) -> str:
         """Build enhanced prompt with all personalization elements"""
+
+        # Start with conversation history if available
+        conversation_context = ""
+        if conversation_history and len(conversation_history) > 0:
+            conversation_context = "CONVERSATION HISTORY:\n"
+            for turn in conversation_history:
+                conversation_context += f"User: {turn['query']}\n"
+                # Truncate long responses to save tokens
+                response_text = turn['response'][:300] + "..." if len(turn['response']) > 300 else turn['response']
+                conversation_context += f"Assistant: {response_text}\n\n"
+            conversation_context += "---\n\n"
 
         # Start with user profile section
         profile_section = f"""User Learning Profile:
@@ -520,7 +655,7 @@ class AdaptiveResponseEngine:
             )
 
         # Combine all sections
-        enhanced_prompt = f"""{profile_section}
+        enhanced_prompt = f"""{conversation_context}{profile_section}
 
 {tone_instructions}
 
