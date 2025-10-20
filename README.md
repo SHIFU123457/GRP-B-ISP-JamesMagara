@@ -4,7 +4,7 @@
 # Study Helper Agent
 An AI-powered Telegram bot that integrates with Learning Management Systems (LMS) to provide personalized academic support through intelligent document retrieval and natural language understanding.
 ## Overview
-Study Helper Agent automates academic assistance by connecting to your Google Classroom (and optionally Moodle), processing course materials, and providing context-aware responses to student queries. The bot uses Retrieval-Augmented Generation (RAG) with LLaMA language models to deliver accurate, source-grounded answers based on your actual course content.
+Study Helper Agent automates academic assistance by connecting to your Google Classroom (and optionally Moodle), processing course materials, and providing context-aware responses to student queries. The bot uses Retrieval-Augmented Generation (RAG) with LLaMA language models to deliver accurate, source-grounded, personalized answers based on your actual course content.
 ## Key Features
 ### LMS Integration
 
@@ -24,8 +24,8 @@ Study Helper Agent automates academic assistance by connecting to your Google Cl
 
 - [x] Interactive Notifications: Context-sensitive help buttons for assignments, quizzes, and readings
 - [x] User Profiles: Records and tracks preferences and interaction history
-- [] Session Analytics: Monitors engagement patterns for continuous improvement
-- [] Adaptive Responses: Tailors explanations based on learning style and difficulty preferences
+- [x] Session engagement & Analytics: Keeps track of and monitors patterns for continuous improvement
+- [] Adaptive Responses: Tailors explanations based on learning style, response-length and difficulty preferences
 
 ### Telegram Interface
 
@@ -57,6 +57,8 @@ Study Helper Agent automates academic assistance by connecting to your Google Cl
 - [x] /status : View system status
 - [x] /profile : View learning profile
 - [x] /settings : Adjust preferences
+- [x] /my_sessions : View sessions
+- [x] /new_session : Create a new session  
 
 
 ### Asking Questions
