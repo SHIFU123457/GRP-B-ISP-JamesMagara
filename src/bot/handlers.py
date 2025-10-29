@@ -188,6 +188,7 @@ class StudyHelperBot:
         # Command handlers
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("new_session", self.new_session_command))
+        self.application.add_handler(CommandHandler("my_sessions", self.my_sessions_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("profile", self.profile_command))
         self.application.add_handler(CommandHandler("courses", self.courses_command))
@@ -346,6 +347,99 @@ Example: "What are the main topics in today's lecture notes?"
                 "Sorry, I encountered an error while creating a new session. Please try again later."
             )
 
+    async def my_sessions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /my_sessions command to view and switch between previous sessions"""
+        user_data = update.effective_user
+
+        try:
+            with db_manager.get_session() as session:
+                user = self._get_or_create_user(session, user_data)
+                user_id = user.id
+
+                # Get all sessions for this user (both active and inactive)
+                all_sessions = session.query(ConversationSession).filter(
+                    ConversationSession.user_id == user_id
+                ).order_by(desc(ConversationSession.last_activity_at)).limit(10).all()
+
+                if not all_sessions:
+                    await update.message.reply_text(
+                        "📭 You don't have any previous sessions yet.\n\n"
+                        "Start chatting with me, and your conversations will be organized into sessions!",
+                        parse_mode='Markdown'
+                    )
+                    return
+
+                # Get current active session
+                current_session = session.query(ConversationSession).filter(
+                    and_(
+                        ConversationSession.user_id == user_id,
+                        ConversationSession.is_active == True
+                    )
+                ).first()
+
+                current_session_id = current_session.session_id if current_session else None
+
+                # Build session list message
+                session_list = []
+                keyboard_buttons = []
+
+                for idx, sess in enumerate(all_sessions, 1):
+                    # Calculate session info
+                    is_current = sess.session_id == current_session_id
+                    status_emoji = "🟢" if is_current else "⚪"
+
+                    # Format timestamp
+                    time_str = sess.last_activity_at.strftime('%b %d, %H:%M') if sess.last_activity_at else 'Unknown'
+
+                    # Calculate duration
+                    if sess.ended_at and sess.started_at:
+                        duration = (sess.ended_at - sess.started_at).total_seconds() / 60
+                    elif is_current and sess.started_at:
+                        duration = (datetime.utcnow() - sess.started_at.replace(tzinfo=None)).total_seconds() / 60
+                    else:
+                        duration = sess.session_duration_minutes or 0
+
+                    # Build session description
+                    topic = sess.primary_topic or "General discussion"
+                    session_desc = (
+                        f"{status_emoji} **Session {idx}** {'(Current)' if is_current else ''}\n"
+                        f"   • Topic: {topic}\n"
+                        f"   • Messages: {sess.message_count}\n"
+                        f"   • Duration: {duration:.0f} min\n"
+                        f"   • Last active: {time_str}"
+                    )
+                    session_list.append(session_desc)
+
+                    # Add button for non-current sessions
+                    if not is_current:
+                        button_text = f"📂 Session {idx}: {topic[:20]}..."
+                        keyboard_buttons.append([
+                            InlineKeyboardButton(
+                                button_text,
+                                callback_data=f"switch_session:{sess.session_id}"
+                            )
+                        ])
+
+                # Build response message
+                response_text = "📚 **Your Conversation Sessions**\n\n" + "\n\n".join(session_list)
+
+                if keyboard_buttons:
+                    response_text += "\n\n💡 **Tap a session below to switch to it:**"
+                    keyboard = InlineKeyboardMarkup(keyboard_buttons)
+                    await update.message.reply_text(response_text, parse_mode='Markdown', reply_markup=keyboard)
+                else:
+                    response_text += "\n\n✨ All sessions shown are either current or completed."
+                    await update.message.reply_text(response_text, parse_mode='Markdown')
+
+                # Log the interaction
+                self._log_interaction(session, user_id, "/my_sessions", "Viewed session list", "command")
+
+        except Exception as e:
+            logger.error(f"Error in my_sessions_command: {e}", exc_info=True)
+            await update.message.reply_text(
+                "Sorry, I encountered an error while retrieving your sessions. Please try again later."
+            )
+
     async def sync_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /sync command for manual synchronization"""
         try:
@@ -466,6 +560,7 @@ Please check the system status or try again later.
 **Basic Commands:**
 /start - Initialize the bot and see welcome message
 /new\\_session - Start a fresh conversation (clear context)
+/my\\_sessions - View and switch between previous sessions
 /help - Show this help message
 /profile - View your learning profile
 /courses - View enrolled courses
@@ -492,16 +587,30 @@ Please check the system status or try again later.
 🔄 **Switch Topics**: Use /new\\_session when changing subjects
    Example: After discussing Python, use /new\\_session before asking about Math
 
+📂 **Resume Sessions**: Use /my\\_sessions to return to previous conversations
+   Example: Switch back to a Python discussion from yesterday
+
 **Tips for Better Results:**
 • Be specific about which course or topic
 • Ask follow-up questions for clarification
 • Use /new\\_session when switching to a different topic
+• Use /my\\_sessions to resume or review past conversations
 • Rate my responses to improve personalization
 • Use /sync to get the latest materials
 • Use /settings to customize your experience
 
+**Personalization Settings:**
+⚙️ Use /settings to manually adjust:
+• **Learning Style**: Example-driven, Socratic, Theory-first, etc.
+• **Response Length**: Short, Medium, or Long responses
+• **Complexity Level**: Beginner, Intermediate, or Advanced
+• **Learning Pace**: Casual, Moderate, or Intensive
+• **Difficulty**: Easy, Medium, or Hard explanations
+
+💡 The system auto-adjusts these every 12 hours based on your interaction patterns, but you can override them anytime!
+
 **About Context Memory:**
-💡 I remember our conversation within a session (30 minutes or until you use /new\\_session). This helps me understand follow-up questions like "explain it with code" or "show me another example."
+💡 I remember our conversation within a session (30 minutes or until you use /new\\_session). This helps me understand follow-up questions like "explain it with code" or "show me another example." You can always resume past sessions using /my\\_sessions!
 
 **Getting Started:**
 1. Use /connect\\_classroom to link your Google account
@@ -816,8 +925,12 @@ Try /connect_classroom again to refresh your connection.
                 InlineKeyboardButton("📊 Difficulty", callback_data="setting_difficulty"),
             ],
             [
-                InlineKeyboardButton("🔔 Notifications", callback_data="setting_notifications"),
                 InlineKeyboardButton("📱 Response Length", callback_data="setting_response_length"),
+                InlineKeyboardButton("🎯 Complexity Level", callback_data="setting_complexity"),
+            ],
+            [
+                InlineKeyboardButton("⚡ Learning Pace", callback_data="setting_pace"),
+                InlineKeyboardButton("🔔 Notifications", callback_data="setting_notifications"),
             ],
             [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")],
         ]
@@ -828,10 +941,12 @@ Try /connect_classroom again to refresh your connection.
 
 Customize your Study Helper Agent experience:
 
-• **Learning Style**: How you prefer to learn (visual, auditory, etc.)
+• **Learning Style**: How you prefer to learn (example-driven, socratic, etc.)
 • **Difficulty Level**: Complexity of explanations you prefer
-• **Notifications**: When to receive updates about new content
 • **Response Length**: How detailed you want my responses
+• **Complexity Level**: Your question complexity preference
+• **Learning Pace**: Your learning intensity level
+• **Notifications**: When to receive updates about new content
 
 Choose a setting to modify:
         """.strip()
@@ -982,11 +1097,49 @@ Choose a setting to modify:
                 return
 
             # Regular query processing
+            # === CENTRALIZED TOPIC EXTRACTION (Extract once, use everywhere) ===
+            from src.services.adaptive_response_engine import adaptive_response_engine
+
+            # Extract topics ONCE at the beginning - this will be reused throughout
+            extracted_topics = adaptive_response_engine.topic_analyzer.extract_topics(query_text)
+            current_topic = extracted_topics[0] if extracted_topics else None
+
             with db_manager.get_session() as session:
                 user = session.query(User).filter(User.id == user_id).first()
 
-                # Use the enhanced RAG processing
-                response_text = await self._process_query_rag_enhanced(query_text, user)
+                # === SENTIMENT & CONFUSION DETECTION ===
+                # Analyze query for confusion/sentiment
+                sentiment_detector = adaptive_response_engine.sentiment_detector
+                sentiment_analysis = sentiment_detector.analyze_query(query_text)
+
+                # Get previous topic from session context
+                conv_session = session_manager.get_or_create_session(user_id, session)
+                previous_topic = conv_session.session_context.get('current_topic') if conv_session.session_context else None
+
+                # Log confusion event to database
+                confusion_event = sentiment_detector.log_confusion_event(
+                    user_id=user_id,
+                    query=query_text,
+                    analysis=sentiment_analysis,
+                    session=session,
+                    session_id=current_session_id,
+                    topic=current_topic,
+                    previous_topic=previous_topic
+                )
+
+                # Update struggle topics if confused
+                if sentiment_analysis.get('is_confused') and current_topic:
+                    adaptive_response_engine.topic_analyzer.update_struggle_topic(
+                        user_id=user_id,
+                        topic=current_topic,
+                        session=session,
+                        is_confused=True
+                    )
+
+                # Use the enhanced RAG processing (pass pre-extracted topics)
+                response_text = await self._process_query_rag_enhanced(
+                    query_text, user, pre_extracted_topics=extracted_topics
+                )
 
                 # Send response (split if too long for Telegram)
                 # Temporarily disable Markdown to fix parsing errors
@@ -1017,26 +1170,22 @@ Choose a setting to modify:
             # Calculate response time
             response_time_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
-            # Update session context with current topic and course
+            # Update session context with current topic and course (reuse extracted topics)
             with db_manager.get_session() as session:
                 conv_session = session_manager.get_or_create_session(user_id, session)
                 user_obj = session.query(User).filter(User.id == user_id).first()
 
-                # Extract topic from query using adaptive_response_engine's topic analyzer
-                from src.services.adaptive_response_engine import adaptive_response_engine
-                topics = adaptive_response_engine.topic_analyzer.extract_topics(query_text)
-
                 # Extract course context
                 course_id = self._extract_course_context(query_text, user_obj)
 
-                # Update session context with current topic
+                # Update session context with current topic (use pre-extracted topics)
                 context_updates = {}
-                if topics:
-                    context_updates['current_topic'] = topics[0]  # Primary topic
-                    context_updates['all_topics'] = topics
+                if extracted_topics:
+                    context_updates['current_topic'] = extracted_topics[0]  # Primary topic
+                    context_updates['all_topics'] = extracted_topics
                     # Track primary topic for session
                     if not conv_session.primary_topic:
-                        conv_session.primary_topic = topics[0]
+                        conv_session.primary_topic = extracted_topics[0]
 
                 # Update courses_discussed list
                 if course_id:
@@ -1150,7 +1299,11 @@ Choose a setting to modify:
                 except Exception as sync_error:
                     logger.error(f"Sync error: {sync_error}")
                     await query.edit_message_text("❌ Sync failed due to internal error.")
-            
+
+            # Session switching callback
+            elif callback_data.startswith("switch_session:"):
+                await self._handle_session_switch(update, callback_data)
+
             #oauth callbacks
             elif callback_data == "confirm_disconnect_gc":
                 user_data = update.effective_user
@@ -1549,8 +1702,21 @@ Choose a setting to modify:
             return f"❌ Error: {e}"
 
 
-    async def _process_query_rag_enhanced(self, query: str, user: User, document_id: Optional[int] = None) -> str:
-        """Enhanced query processing with RAG pipeline and LLM integration"""
+    async def _process_query_rag_enhanced(
+        self,
+        query: str,
+        user: User,
+        document_id: Optional[int] = None,
+        pre_extracted_topics: Optional[List[str]] = None
+    ) -> str:
+        """Enhanced query processing with RAG pipeline and LLM integration
+
+        Args:
+            query: User's query text
+            user: User object
+            document_id: Optional specific document to search
+            pre_extracted_topics: Optional pre-extracted topics to avoid redundant LLM calls
+        """
         if not self.rag_pipeline:
             logger.error("RAG pipeline not initialized")
             return await self._process_query_basic(query, user)  # Fallback to basic
@@ -1586,13 +1752,14 @@ Choose a setting to modify:
                 'response_length': getattr(user, 'preferred_response_length', 'medium')
             }
 
-            # Generate RAG response using the enhanced pipeline
+            # Generate RAG response using the enhanced pipeline (pass pre-extracted topics)
             rag_result = self.rag_pipeline.generate_rag_response(
                 query,
                 user_id=user.id, # Pass user_id for data isolation
                 course_id=course_id,
                 document_id=document_id,
-                user_preferences=user_preferences
+                user_preferences=user_preferences,
+                pre_extracted_topics=pre_extracted_topics  # Pass topics to avoid re-extraction
             )
             
             # Format the response with sources and confidence indicator
@@ -1835,10 +2002,10 @@ Use /help for available commands!
     async def _handle_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
         """Handle user feedback on responses"""
         query = update.callback_query
-        
+
         # Parse feedback
         is_helpful = "helpful" in callback_data and "unhelpful" not in callback_data
-        
+
         try:
             user_data = update.effective_user
             with db_manager.get_session() as session:
@@ -1848,18 +2015,127 @@ Use /help for available commands!
                     recent_interaction = session.query(UserInteraction).filter(
                         UserInteraction.user_id == user.id
                     ).order_by(UserInteraction.created_at.desc()).first()
-                    
+
                     if recent_interaction:
+                        user_rating = 5 if is_helpful else 2
                         recent_interaction.was_helpful = is_helpful
-                        recent_interaction.user_rating = 5 if is_helpful else 2
+                        recent_interaction.user_rating = user_rating
                         session.commit()
-            
+
+                        # === UPDATE STRUGGLE TOPICS WITH RATING ===
+                        from src.services.adaptive_response_engine import adaptive_response_engine
+
+                        # Extract topic from the query
+                        topics = adaptive_response_engine.topic_analyzer.extract_topics(recent_interaction.query_text)
+                        if topics:
+                            current_topic = topics[0]
+
+                            # Update struggle topic with rating
+                            adaptive_response_engine.topic_analyzer.update_struggle_topic(
+                                user_id=user.id,
+                                topic=current_topic,
+                                session=session,
+                                user_rating=user_rating
+                            )
+
             feedback_text = "👍 Thanks for the feedback! This helps me learn." if is_helpful else "👎 Thanks for the feedback. I'll work on improving my responses."
             await query.edit_message_text(feedback_text)
-            
+
         except Exception as e:
             logger.error(f"Error handling feedback: {e}")
             await query.edit_message_text("Thanks for the feedback!")
+
+    async def _handle_session_switch(self, update: Update, callback_data: str):
+        """Handle switching to a different conversation session"""
+        query = update.callback_query
+        user_data = query.from_user
+
+        try:
+            # Extract session_id from callback_data (format: "switch_session:session_id")
+            session_id = callback_data.replace("switch_session:", "")
+
+            with db_manager.get_session() as session:
+                user = self._get_or_create_user(session, user_data)
+                user_id = user.id
+
+                # Find the target session
+                target_session = session.query(ConversationSession).filter(
+                    and_(
+                        ConversationSession.user_id == user_id,
+                        ConversationSession.session_id == session_id
+                    )
+                ).first()
+
+                if not target_session:
+                    await query.edit_message_text("❌ Session not found. It may have been deleted.")
+                    return
+
+                # Close current active session
+                current_session = session.query(ConversationSession).filter(
+                    and_(
+                        ConversationSession.user_id == user_id,
+                        ConversationSession.is_active == True
+                    )
+                ).first()
+
+                if current_session and current_session.session_id != session_id:
+                    # Close the current session
+                    session_manager.force_close_session(current_session.session_id)
+                    logger.info(f"User {user_id} closed session {current_session.session_id} to switch")
+
+                # Activate the target session
+                target_session.is_active = True
+                target_session.last_activity_at = datetime.now(timezone.utc)
+                session.commit()
+
+                # Get session context to show user
+                topic = target_session.primary_topic or "General discussion"
+                message_count = target_session.message_count
+
+                # Get the last few interactions from this session to provide context
+                session_interactions = session.query(UserInteraction).filter(
+                    and_(
+                        UserInteraction.user_id == user_id,
+                        UserInteraction.session_id == session_id
+                    )
+                ).order_by(desc(UserInteraction.created_at)).limit(3).all()
+
+                # Build context preview
+                context_preview = ""
+                if session_interactions:
+                    recent_questions = [
+                        f"   • {interaction.query_text[:60]}..."
+                        for interaction in reversed(session_interactions)
+                        if interaction.query_text
+                    ]
+                    if recent_questions:
+                        context_preview = "\n\n📝 **Recent questions in this session:**\n" + "\n".join(recent_questions[:3])
+
+                response_text = f"""✅ **Session Switched Successfully!**
+
+📂 **Session Details:**
+• Topic: {topic}
+• Messages: {message_count}
+• Started: {target_session.started_at.strftime('%b %d, %Y at %H:%M') if target_session.started_at else 'Unknown'}
+{context_preview}
+
+💬 You can now continue this conversation. I'll use the context from this session when responding to your questions.
+
+💡 Use /new\\_session to start a fresh topic, or /my\\_sessions to switch to another session.
+                """.strip()
+
+                await query.edit_message_text(response_text, parse_mode='Markdown')
+
+                # Log the session switch
+                self._log_interaction(session, user_id, f"/switch_session:{session_id}", f"Switched to session: {topic}", "command")
+
+                logger.info(f"User {user_id} switched to session {session_id} (topic: {topic})")
+
+        except Exception as e:
+            logger.error(f"Error in _handle_session_switch: {e}", exc_info=True)
+            await query.edit_message_text(
+                "❌ Sorry, I encountered an error while switching sessions. Please try again."
+            )
 
     async def _handle_preference_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str):
         """Handle user preference changes (learning style and difficulty)"""
@@ -1886,12 +2162,46 @@ Use /help for available commands!
                 "hard": "Hard"
             }
 
+            # Response length preferences
+            response_lengths = {
+                "short": "Short",
+                "medium_length": "Medium",
+                "long": "Long"
+            }
+
+            # Complexity level preferences
+            complexity_levels = {
+                "beginner": "Beginner",
+                "intermediate": "Intermediate",
+                "advanced": "Advanced"
+            }
+
+            # Learning pace preferences
+            pace_levels = {
+                "casual": "Casual",
+                "moderate": "Moderate",
+                "intensive": "Intensive"
+            }
+
             with db_manager.get_session() as session:
                 user = session.query(User).filter(User.telegram_id == str(user_data.id)).first()
 
                 if not user:
                     await query.edit_message_text("❌ User not found. Please use /start first.")
                     return
+
+                # Get or create profile for response length
+                profile = session.query(PersonalizationProfile).filter(
+                    PersonalizationProfile.user_id == user.id
+                ).first()
+
+                if not profile:
+                    profile = PersonalizationProfile(
+                        user_id=user.id,
+                        preferred_response_length="medium"
+                    )
+                    session.add(profile)
+                    session.flush()
 
                 # Handle learning style change
                 if preference_value in learning_styles:
@@ -1953,6 +2263,105 @@ Use /help for available commands!
 
                     logger.info(f"User {user.id} changed difficulty from '{old_difficulty}' to '{preference_value}'")
 
+                # Handle response length change
+                elif preference_value in response_lengths:
+                    # Convert 'medium_length' back to 'medium' for DB
+                    actual_value = 'medium' if preference_value == 'medium_length' else preference_value
+                    old_length = profile.preferred_response_length
+                    profile.preferred_response_length = actual_value
+                    session.commit()
+
+                    length_name = response_lengths[preference_value]
+
+                    length_descriptions = {
+                        "short": "You'll get concise responses (3-5 paragraphs) focusing on core concepts.",
+                        "medium_length": "You'll get balanced explanations (5-8 paragraphs) with examples and details.",
+                        "long": "You'll get comprehensive, detailed responses (8-15 paragraphs) with multiple examples and in-depth coverage."
+                    }
+
+                    description = length_descriptions.get(preference_value, "")
+
+                    await query.edit_message_text(
+                        f"✅ **Response Length Updated!**\n\n"
+                        f"Your response length preference has been set to: **{length_name}**\n\n"
+                        f"{description}\n\n"
+                        f"💡 Note: The system will automatically re-evaluate this preference every 12 hours based on which response lengths you rate most highly.\n\n"
+                        f"You can change this anytime using /settings",
+                        parse_mode='Markdown'
+                    )
+
+                    logger.info(f"User {user.id} changed response length from '{old_length}' to '{actual_value}'")
+
+                # Handle complexity level change
+                elif preference_value in complexity_levels:
+                    # Map user-friendly names to numeric values (0.0-1.0)
+                    complexity_mapping = {
+                        "beginner": 0.2,      # Low complexity
+                        "intermediate": 0.5,  # Medium complexity
+                        "advanced": 0.8       # High complexity
+                    }
+
+                    old_complexity = profile.question_complexity_level
+                    new_complexity_value = complexity_mapping[preference_value]
+                    profile.question_complexity_level = new_complexity_value
+                    session.commit()
+
+                    complexity_name = complexity_levels[preference_value]
+
+                    complexity_descriptions = {
+                        "beginner": "Responses will start with absolute basics, define all terms clearly, and avoid assuming prior knowledge.",
+                        "intermediate": "Responses will provide balanced explanations with some prior knowledge assumed.",
+                        "advanced": "Responses will skip basic definitions, include edge cases and nuances, and reference advanced concepts freely."
+                    }
+
+                    description = complexity_descriptions.get(preference_value, "")
+
+                    await query.edit_message_text(
+                        f"✅ **Question Complexity Level Updated!**\n\n"
+                        f"Your complexity level has been set to: **{complexity_name}**\n\n"
+                        f"{description}\n\n"
+                        f"💡 Note: The system will automatically re-evaluate this level every 12 hours based on your question patterns.\n\n"
+                        f"You can change this anytime using /settings",
+                        parse_mode='Markdown'
+                    )
+
+                    logger.info(f"User {user.id} changed complexity level from '{old_complexity}' to '{new_complexity_value}' ({preference_value})")
+
+                # Handle learning pace change
+                elif preference_value in pace_levels:
+                    # Map user-friendly names to system values
+                    pace_mapping = {
+                        "casual": "slow",
+                        "moderate": "medium",
+                        "intensive": "fast"
+                    }
+
+                    old_pace = profile.learning_pace
+                    new_pace_value = pace_mapping[preference_value]
+                    profile.learning_pace = new_pace_value
+                    session.commit()
+
+                    pace_name = pace_levels[preference_value]
+
+                    pace_descriptions = {
+                        "casual": "Responses will be focused and digestible, emphasizing retention and clarity over breadth.",
+                        "moderate": "Responses will have standard information density with a good mix of depth and breadth.",
+                        "intensive": "Responses will pack more information, suggest related topics, and assume quick comprehension."
+                    }
+
+                    description = pace_descriptions.get(preference_value, "")
+
+                    await query.edit_message_text(
+                        f"✅ **Learning Pace Updated!**\n\n"
+                        f"Your learning pace has been set to: **{pace_name}**\n\n"
+                        f"{description}\n\n"
+                        f"💡 Note: The system will automatically re-evaluate this pace every 12 hours based on your interaction patterns.\n\n"
+                        f"You can change this anytime using /settings",
+                        parse_mode='Markdown'
+                    )
+
+                    logger.info(f"User {user.id} changed learning pace from '{old_pace}' to '{new_pace_value}' ({preference_value})")
+
                 else:
                     await query.edit_message_text("❌ Invalid preference option.")
 
@@ -2008,7 +2417,80 @@ Use /help for available commands!
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
-        
+
+        elif setting_type == "response_length":
+            keyboard = [
+                [
+                    InlineKeyboardButton("📏 Short", callback_data="set_short"),
+                    InlineKeyboardButton("📐 Medium", callback_data="set_medium_length"),
+                    InlineKeyboardButton("📊 Long", callback_data="set_long")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "📱 **Choose Response Length:**\n\n"
+                "• **Short**: Concise responses (3-5 paragraphs)\n"
+                "• **Medium**: Balanced explanations (5-8 paragraphs)\n"
+                "• **Long**: Comprehensive, detailed responses (8-15 paragraphs)\n\n"
+                "💡 Note: The system will automatically adjust this based on your ratings every 12 hours.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif setting_type == "complexity":
+            keyboard = [
+                [
+                    InlineKeyboardButton("🌱 Beginner", callback_data="set_beginner"),
+                    InlineKeyboardButton("🌿 Intermediate", callback_data="set_intermediate"),
+                    InlineKeyboardButton("🌳 Advanced", callback_data="set_advanced")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "🎯 **Choose Your Question Complexity Level:**\n\n"
+                "• **Beginner**: Simple, foundational questions\n"
+                "  → Responses start with absolute basics\n"
+                "  → All terms clearly defined\n"
+                "  → No prior knowledge assumed\n\n"
+                "• **Intermediate**: Moderate complexity questions\n"
+                "  → Balanced explanations\n"
+                "  → Some prior knowledge assumed\n\n"
+                "• **Advanced**: Complex, technical questions\n"
+                "  → Skip basic definitions\n"
+                "  → Include edge cases and nuances\n"
+                "  → Advanced concepts referenced freely\n\n"
+                "💡 Note: The system will automatically adjust this based on your question patterns every 12 hours.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+        elif setting_type == "pace":
+            keyboard = [
+                [
+                    InlineKeyboardButton("🐢 Casual", callback_data="set_casual"),
+                    InlineKeyboardButton("🚶 Moderate", callback_data="set_moderate"),
+                    InlineKeyboardButton("🏃 Intensive", callback_data="set_intensive")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "⚡ **Choose Your Learning Pace:**\n\n"
+                "• **Casual**: Relaxed, steady learning\n"
+                "  → Focused, digestible information\n"
+                "  → Emphasis on retention and clarity\n"
+                "  → Patient with repetition\n\n"
+                "• **Moderate**: Balanced learning pace\n"
+                "  → Standard information density\n"
+                "  → Good mix of depth and breadth\n\n"
+                "• **Intensive**: Fast-paced, intensive learning\n"
+                "  → More information per response\n"
+                "  → Related topics suggested\n"
+                "  → Assumes quick comprehension\n\n"
+                "💡 Note: The system will automatically adjust this based on your interaction patterns every 12 hours.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
         else:
             await query.edit_message_text("Setting configuration coming soon!")
     
@@ -2077,10 +2559,32 @@ Use /help for available commands!
         except Exception as e:
             logger.error(f"Error logging RAG interaction: {e}")
 
-    def _log_interaction(self, session: Session, user_id: int, query: str, response: str, interaction_type: str):
-        """Log user interaction for analytics and personalization"""
+    def _log_interaction(self, session: Session, user_id: int, query: str, response: str, interaction_type: str, session_id: Optional[str] = None):
+        """Log user interaction for analytics and personalization
+
+        Args:
+            session: Database session
+            user_id: User ID
+            query: User's query text
+            response: Bot's response text
+            interaction_type: Type of interaction (question, command, etc.)
+            session_id: Optional conversation session ID. If not provided, will use active session.
+        """
+        # Get session_id if not provided
+        if not session_id:
+            active_session = session.query(ConversationSession).filter(
+                and_(
+                    ConversationSession.user_id == user_id,
+                    ConversationSession.is_active == True
+                )
+            ).order_by(desc(ConversationSession.last_activity_at)).first()
+
+            if active_session:
+                session_id = active_session.session_id
+
         interaction = UserInteraction(
             user_id=user_id,
+            session_id=session_id,  # Link to conversation session
             query_text=query,
             response_text=response,
             interaction_type=interaction_type,
@@ -2095,7 +2599,7 @@ Use /help for available commands!
 
         if profile:
             profile.total_interactions += 1
-            profile.last_interaction = datetime.now()
+            profile.last_interaction = datetime.now(timezone.utc)
 
         session.commit()
 

@@ -526,13 +526,21 @@ class RAGPipeline:
             # Simple fallback if LLM fails
             return "I'm here to help with your studies! Feel free to ask me about your course materials or any academic topics."
 
-    def generate_rag_response(self, query: str, user_id: int, course_id: Optional[int] = None, document_id: Optional[int] = None, user_preferences: Dict[str, Any] = None) -> Dict[str, Any]:
+    def generate_rag_response(self, query: str, user_id: int, course_id: Optional[int] = None, document_id: Optional[int] = None, user_preferences: Dict[str, Any] = None, pre_extracted_topics: Optional[List[str]] = None) -> Dict[str, Any]:
         """Generate complete RAG response using LLM with retrieved context
 
         Strategy: RAG-first approach
         1. Check for obvious non-educational queries (greetings, chitchat)
         2. Always attempt RAG retrieval for everything else
         3. If similarity < 10%, fall back to generic LLM
+
+        Args:
+            query: User's query text
+            user_id: User database ID
+            course_id: Optional course context
+            document_id: Optional document context
+            user_preferences: User preferences for personalization
+            pre_extracted_topics: Optional pre-extracted topics to avoid redundant LLM calls
         """
         try:
             # Only skip RAG for obvious non-educational queries (greetings, chitchat)
@@ -593,16 +601,17 @@ ANSWER:"""
                         limit=3  # Last 3 conversation turns
                     )
 
-                    # Enhance prompt with adaptive features
+                    # Enhance prompt with adaptive features (pass pre-extracted topics if available)
                     enhanced_prompt, metadata = adaptive_response_engine.analyze_and_enhance_prompt(
                         user_id=user_id,
                         query=query,
                         base_prompt=base_prompt,
                         session=session,
-                        conversation_history=conversation_history
+                        conversation_history=conversation_history,
+                        pre_extracted_topics=pre_extracted_topics
                     )
 
-                    logger.info(f"Adaptive response metadata: verbosity={metadata.get('verbosity_score'):.1f}/10, "
+                    logger.info(f"Adaptive response metadata: verbosity={metadata.get('verbosity_preference', 'medium')}, "
                                f"style={metadata.get('explanation_style', 'adaptive')}, "
                                f"sentiment={metadata.get('sentiment', {}).get('detected_patterns', [])}, "
                                f"topics={metadata.get('current_topics', [])}")

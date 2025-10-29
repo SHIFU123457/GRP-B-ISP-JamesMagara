@@ -646,16 +646,18 @@ class SchedulerService:
 
     def _reclassify_learning_styles(self):
         """
-        Reclassify learning styles for all active users (runs every 12 hours)
+        Reclassify learning styles AND response length preferences for all active users (runs every 12 hours)
 
-        This task analyzes each user's last 30 interactions and updates their
-        learning style based on detected patterns in their queries.
+        This task:
+        1. Analyzes each user's last 30 interactions and updates their learning style
+        2. Analyzes each user's last 50 rated interactions and updates response length preference
         """
         try:
-            logger.info("🎓 Starting scheduled learning style reclassification...")
+            logger.info("🎓 Starting scheduled personalization reclassification...")
 
-            from src.data.models import UserInteraction
+            from src.data.models import UserInteraction, PersonalizationProfile
             from src.services.explanation_style_engine import explanation_style_engine
+            from src.services.personalization_engine import personalization_engine
 
             with db_manager.get_session() as session:
                 # Get all users who have interacted in the last 30 days
@@ -672,28 +674,30 @@ class SchedulerService:
                     logger.info("No active users found for reclassification")
                     return
 
-                logger.info(f"Reclassifying learning styles for {len(active_user_ids)} active users...")
+                logger.info(f"Reclassifying personalization for {len(active_user_ids)} active users...")
 
                 reclassified_count = 0
                 style_changes = []
+                length_changes = []
 
                 for user_id in active_user_ids:
                     try:
-                        # Get user
+                        # Get user and profile
                         user = session.query(User).filter(User.id == user_id).first()
                         if not user:
                             continue
 
+                        profile = session.query(PersonalizationProfile).filter(
+                            PersonalizationProfile.user_id == user_id
+                        ).first()
+
+                        # === 1. Reclassify learning style ===
                         old_style = user.learning_style
 
-                        # Force reclassification
                         new_style, scores = explanation_style_engine.get_user_learning_style(
                             user_id, session, force_reclassify=True
                         )
 
-                        reclassified_count += 1
-
-                        # Log style changes
                         if old_style != new_style:
                             style_changes.append({
                                 'user_id': user_id,
@@ -701,7 +705,67 @@ class SchedulerService:
                                 'new_style': new_style,
                                 'scores': scores
                             })
-                            logger.info(f"📊 User {user_id} style changed: {old_style} → {new_style}")
+                            logger.info(f"📊 User {user_id} learning style: {old_style} → {new_style}")
+
+                        # === 2. Reclassify response length preference ===
+                        old_length = profile.preferred_response_length if profile else 'medium'
+
+                        new_length = personalization_engine.update_response_length_preference(
+                            user_id, session
+                        )
+
+                        # Update profile
+                        if profile:
+                            profile.preferred_response_length = new_length
+                            session.commit()
+                        else:
+                            # Create profile if doesn't exist
+                            new_profile = PersonalizationProfile(
+                                user_id=user_id,
+                                preferred_response_length=new_length
+                            )
+                            session.add(new_profile)
+                            session.commit()
+
+                        if old_length != new_length:
+                            length_changes.append({
+                                'user_id': user_id,
+                                'old_length': old_length,
+                                'new_length': new_length
+                            })
+                            logger.info(f"📏 User {user_id} response length: {old_length} → {new_length}")
+
+                        # === 3. Update Question Complexity Level ===
+                        interactions_for_complexity = session.query(UserInteraction).filter(
+                            and_(
+                                UserInteraction.user_id == user_id,
+                                UserInteraction.interaction_type == 'question'
+                            )
+                        ).order_by(desc(UserInteraction.created_at)).limit(50).all()
+
+                        new_complexity = personalization_engine._estimate_question_complexity(interactions_for_complexity)
+                        old_complexity = profile.question_complexity_level if profile else 0.5
+
+                        if profile:
+                            profile.question_complexity_level = new_complexity
+                            session.commit()
+
+                        # Log significant changes (>0.1 difference)
+                        if abs(new_complexity - old_complexity) > 0.1:
+                            logger.info(f"🧠 User {user_id} complexity: {old_complexity:.2f} → {new_complexity:.2f}")
+
+                        # === 4. Update Learning Pace ===
+                        new_pace = personalization_engine._determine_learning_pace(user_id, session)
+                        old_pace = profile.learning_pace if profile else 'medium'
+
+                        if profile:
+                            profile.learning_pace = new_pace
+                            session.commit()
+
+                        if old_pace != new_pace:
+                            logger.info(f"⚡ User {user_id} learning pace: {old_pace} → {new_pace}")
+
+                        reclassified_count += 1
 
                     except Exception as e:
                         logger.error(f"Error reclassifying user {user_id}: {e}")
@@ -709,17 +773,24 @@ class SchedulerService:
 
                 # Log summary
                 logger.info(
-                    f"✅ Learning style reclassification completed: "
-                    f"{reclassified_count} users processed, "
-                    f"{len(style_changes)} style changes detected"
+                    f"✅ Personalization reclassification completed:\n"
+                    f"   - {reclassified_count} users processed\n"
+                    f"   - {len(style_changes)} learning style changes\n"
+                    f"   - {len(length_changes)} response length changes"
                 )
 
+                # Log detailed changes
                 if style_changes:
-                    # Log detailed changes
                     for change in style_changes[:10]:  # Show first 10 changes
                         logger.debug(
                             f"  User {change['user_id']}: {change['old_style']} → {change['new_style']} "
                             f"(scores: {change['scores']})"
+                        )
+
+                if length_changes:
+                    for change in length_changes[:10]:  # Show first 10 changes
+                        logger.debug(
+                            f"  User {change['user_id']}: {change['old_length']} → {change['new_length']}"
                         )
 
         except Exception as e:

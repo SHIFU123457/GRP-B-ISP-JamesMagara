@@ -175,6 +175,11 @@ class LearningStyleClassifier:
                 style_scores, interactions
             )
 
+            # Apply rating influence (amplify/dampen based on user satisfaction)
+            style_scores = self._apply_rating_influence(
+                style_scores, interactions
+            )
+
             # Determine primary style (highest score)
             if max(style_scores.values()) < 0.15:
                 # No clear preference
@@ -237,6 +242,74 @@ class LearningStyleClassifier:
             style_scores['analogy_driven'] += 0.1
 
         return style_scores
+
+    def _apply_rating_influence(
+        self,
+        style_scores: Dict[str, float],
+        interactions: List[UserInteraction]
+    ) -> Dict[str, float]:
+        """
+        Apply rating influence to style scores (amplify/dampen based on satisfaction)
+
+        Strategy:
+        - For each style detected in queries, check if user rated those interactions
+        - Calculate average rating when that style was detected
+        - Apply multiplier: high ratings boost score, low ratings reduce it
+        - Multiplier range: 0.7x (poor ratings) to 1.3x (excellent ratings)
+
+        This ensures ratings INFLUENCE but don't DICTATE the classification.
+        """
+        # Group interactions by detected query style and collect ratings
+        style_ratings = {
+            'example_driven': [],
+            'analogy_driven': [],
+            'socratic': [],
+            'theory_first': []
+        }
+
+        for interaction in interactions:
+            # Skip unrated interactions
+            if not interaction.user_rating or interaction.user_rating < 1:
+                continue
+
+            # Analyze which style(s) this query matches
+            query_style = self.analyze_query_style(interaction.query_text)
+
+            # Add rating to each style's list (weighted by style score)
+            for style, score in query_style.items():
+                if score > 0.1:  # Only consider styles with meaningful matches
+                    style_ratings[style].append(interaction.user_rating)
+
+        # Calculate rating multipliers for each style
+        rating_multipliers = {}
+        for style, ratings in style_ratings.items():
+            if len(ratings) >= 3:  # Minimum 3 rated samples for reliability
+                avg_rating = sum(ratings) / len(ratings)
+
+                # Map rating (1-5) to multiplier (0.7-1.3)
+                # 5 stars → 1.3x boost
+                # 4 stars → 1.15x boost
+                # 3 stars → 1.0x (neutral)
+                # 2 stars → 0.85x reduction
+                # 1 star → 0.7x reduction
+                multiplier = 0.7 + (avg_rating - 1) * 0.15
+                rating_multipliers[style] = multiplier
+
+                logger.debug(f"Style '{style}': {len(ratings)} rated interactions, "
+                           f"avg rating {avg_rating:.2f}, multiplier {multiplier:.2f}x")
+            else:
+                # Not enough data, use neutral multiplier
+                rating_multipliers[style] = 1.0
+
+        # Apply multipliers to style scores
+        adjusted_scores = {}
+        for style, score in style_scores.items():
+            multiplier = rating_multipliers.get(style, 1.0)
+            adjusted_scores[style] = score * multiplier
+
+        logger.info(f"Rating influence applied. Multipliers: {rating_multipliers}")
+
+        return adjusted_scores
 
 
 class StyleBasedPromptGenerator:

@@ -218,7 +218,9 @@ class SessionManager:
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
         """
-        Get recent conversation history for context from current active session ONLY
+        Get recent conversation history for context from specific session
+
+        Uses session_id foreign key for accurate session-based filtering.
 
         Args:
             user_id: User database ID
@@ -230,7 +232,7 @@ class SessionManager:
             List of conversation turns with query and response
         """
         try:
-            # Get the active session to determine time boundary
+            # Get the target session
             if not session_id:
                 active_session = db_session.query(ConversationSession).filter(
                     and_(
@@ -238,23 +240,27 @@ class SessionManager:
                         ConversationSession.is_active == True
                     )
                 ).order_by(desc(ConversationSession.last_activity_at)).first()
+
+                if not active_session:
+                    self.logger.debug(f"No active session found for user {user_id}")
+                    return []
+
+                session_id = active_session.session_id
             else:
+                # Verify session exists
                 active_session = db_session.query(ConversationSession).filter(
                     ConversationSession.session_id == session_id
                 ).first()
 
-            if not active_session:
-                self.logger.debug(f"No active session found for user {user_id}")
-                return []
+                if not active_session:
+                    self.logger.warning(f"Session {session_id} not found")
+                    return []
 
-            # Only get interactions that occurred AFTER this session started
-            # This prevents pulling old conversation history from previous sessions
-            session_start_time = active_session.started_at.replace(tzinfo=None) if active_session.started_at else datetime.utcnow()
-
+            # Query interactions by session_id (much more accurate than time-based filtering)
             recent_interactions = db_session.query(UserInteraction).filter(
                 and_(
                     UserInteraction.user_id == user_id,
-                    UserInteraction.created_at >= session_start_time
+                    UserInteraction.session_id == session_id
                 )
             ).order_by(desc(UserInteraction.created_at)).limit(limit).all()
 
@@ -269,7 +275,7 @@ class SessionManager:
                     'timestamp': interaction.created_at.isoformat() if interaction.created_at else None
                 })
 
-            self.logger.info(f"Retrieved {len(history)} conversation turns for user {user_id} from session {active_session.session_id} (started at {session_start_time})")
+            self.logger.info(f"Retrieved {len(history)} conversation turns for user {user_id} from session {session_id}")
             return history
 
         except Exception as e:
@@ -349,7 +355,7 @@ class PersonalizationEngine:
     def _estimate_question_complexity(self, interactions: List[UserInteraction]) -> float:
         """
         Estimate user's question complexity preference (0-1 scale)
-        Based on query length and interaction patterns
+        Based on query length and interaction patterns, with rating influence
         """
         if not interactions:
             return 0.5
@@ -357,13 +363,20 @@ class PersonalizationEngine:
         query_lengths = [len(i.query_text.split()) for i in interactions if i.query_text]
         avg_length = sum(query_lengths) / len(query_lengths) if query_lengths else 10
 
-        # Normalize: < 5 words = simple (0.3), 5-15 = medium (0.5), > 15 = complex (0.8)
+        # Base complexity from query length
         if avg_length < 5:
-            return 0.3
+            base_complexity = 0.3
         elif avg_length < 15:
-            return 0.5
+            base_complexity = 0.5
         else:
-            return 0.8
+            base_complexity = 0.8
+
+        # Apply rating influence to adjust complexity preference
+        adjusted_complexity = self._apply_complexity_rating_influence(
+            base_complexity, interactions
+        )
+
+        return adjusted_complexity
 
     def _find_active_hours(self, interactions: List[UserInteraction]) -> List[int]:
         """Find hours when user is most active"""
@@ -376,6 +389,273 @@ class PersonalizationEngine:
         """Calculate average response quality based on user ratings"""
         ratings = [i.user_rating for i in interactions if i.user_rating]
         return sum(ratings) / len(ratings) if ratings else 0.0
+
+    def _apply_complexity_rating_influence(
+        self,
+        base_complexity: float,
+        interactions: List[UserInteraction]
+    ) -> float:
+        """
+        Apply rating influence to complexity score
+
+        Strategy:
+        - Group rated interactions by query word count (proxy for complexity asked)
+        - Check if higher/lower complexity questions get better ratings
+        - Nudge the base_complexity toward the preferred direction
+        - Adjustment range: ±0.15 (ratings suggest preference but don't override)
+
+        Returns:
+            Adjusted complexity value (0.0-1.0)
+        """
+        # Separate interactions into complexity buckets and collect ratings
+        simple_ratings = []   # < 5 words
+        medium_ratings = []   # 5-15 words
+        complex_ratings = []  # > 15 words
+
+        for interaction in interactions:
+            if not interaction.user_rating or interaction.user_rating < 1:
+                continue
+
+            word_count = len(interaction.query_text.split()) if interaction.query_text else 0
+
+            if word_count < 5:
+                simple_ratings.append(interaction.user_rating)
+            elif word_count < 15:
+                medium_ratings.append(interaction.user_rating)
+            else:
+                complex_ratings.append(interaction.user_rating)
+
+        # Need at least 5 samples in at least 2 categories for reliable comparison
+        categories_with_data = sum([
+            1 for ratings in [simple_ratings, medium_ratings, complex_ratings]
+            if len(ratings) >= 5
+        ])
+
+        if categories_with_data < 2:
+            # Not enough data, return base complexity
+            return base_complexity
+
+        # Calculate average ratings for each category
+        avg_ratings = {}
+        if len(simple_ratings) >= 5:
+            avg_ratings[0.3] = sum(simple_ratings) / len(simple_ratings)
+        if len(medium_ratings) >= 5:
+            avg_ratings[0.5] = sum(medium_ratings) / len(medium_ratings)
+        if len(complex_ratings) >= 5:
+            avg_ratings[0.8] = sum(complex_ratings) / len(complex_ratings)
+
+        # Find which complexity level has best ratings
+        if avg_ratings:
+            best_complexity = max(avg_ratings, key=avg_ratings.get)
+            best_rating = avg_ratings[best_complexity]
+
+            # Calculate adjustment: nudge toward best-rated complexity
+            # Max adjustment: ±0.15 (15% of scale)
+            rating_difference = best_rating - sum(avg_ratings.values()) / len(avg_ratings)
+            adjustment = (best_complexity - base_complexity) * min(abs(rating_difference) / 2.0, 0.3)
+
+            adjusted = base_complexity + adjustment
+
+            # Clamp to valid range
+            adjusted = max(0.2, min(0.9, adjusted))
+
+            self.logger.debug(
+                f"Complexity adjustment: base={base_complexity:.2f}, "
+                f"best_rated={best_complexity:.2f} (rating={best_rating:.2f}), "
+                f"adjusted={adjusted:.2f}"
+            )
+
+            return adjusted
+
+        return base_complexity
+
+    def _apply_pace_rating_influence(
+        self,
+        base_pace: str,
+        interactions: List[UserInteraction]
+    ) -> str:
+        """
+        Apply rating influence to learning pace
+
+        Strategy:
+        - Separate interactions by response length (proxy for information density)
+        - Short responses = casual pace, Long responses = intensive pace
+        - Check which gets better ratings
+        - Nudge pace one level up/down if clear preference exists
+        - Requires strong signal (0.5+ rating difference) to change
+
+        Returns:
+            Adjusted pace: 'slow', 'medium', or 'fast'
+        """
+        # Separate by response length and collect ratings
+        short_responses = []   # < 500 chars (casual pace)
+        medium_responses = []  # 500-1500 chars (medium pace)
+        long_responses = []    # > 1500 chars (intensive pace)
+
+        for interaction in interactions:
+            if not interaction.user_rating or interaction.user_rating < 1:
+                continue
+
+            response_len = len(interaction.response_text) if interaction.response_text else 0
+
+            if response_len < 500:
+                short_responses.append(interaction.user_rating)
+            elif response_len < 1500:
+                medium_responses.append(interaction.user_rating)
+            else:
+                long_responses.append(interaction.user_rating)
+
+        # Need at least 5 samples in at least 2 categories for comparison
+        categories_with_data = sum([
+            1 for ratings in [short_responses, medium_responses, long_responses]
+            if len(ratings) >= 5
+        ])
+
+        if categories_with_data < 2:
+            # Not enough data, return base pace
+            return base_pace
+
+        # Calculate average ratings
+        avg_ratings = {}
+        if len(short_responses) >= 5:
+            avg_ratings['slow'] = sum(short_responses) / len(short_responses)
+        if len(medium_responses) >= 5:
+            avg_ratings['medium'] = sum(medium_responses) / len(medium_responses)
+        if len(long_responses) >= 5:
+            avg_ratings['fast'] = sum(long_responses) / len(long_responses)
+
+        if not avg_ratings:
+            return base_pace
+
+        # Find best-rated pace
+        best_pace = max(avg_ratings, key=avg_ratings.get)
+        best_rating = avg_ratings[best_pace]
+        avg_rating = sum(avg_ratings.values()) / len(avg_ratings)
+
+        # Only adjust if there's a significant difference (0.5+ stars)
+        rating_difference = best_rating - avg_rating
+
+        if rating_difference >= 0.5:
+            # Strong signal: prefer the best-rated pace
+            self.logger.debug(
+                f"Pace adjustment: base={base_pace}, "
+                f"best_rated={best_pace} (rating={best_rating:.2f}), "
+                f"difference={rating_difference:.2f}"
+            )
+            return best_pace
+        else:
+            # Weak signal: keep base pace
+            return base_pace
+
+    def update_response_length_preference(self, user_id: int, session: Session) -> str:
+        """
+        Auto-update preferred_response_length based on user ratings and explicit signals
+
+        Analyzes last 50 rated interactions to determine which response lengths
+        get the best ratings from the user.
+
+        Strategy:
+        1. Count explicit brevity/detail requests in queries
+        2. If >60% explicit signals for one type → use that
+        3. Otherwise, categorize responses by length and compare avg ratings
+        4. Choose length category with highest avg rating (min 10 samples)
+
+        Args:
+            user_id: User database ID
+            session: Database session
+
+        Returns:
+            Updated preference: 'short', 'medium', or 'long'
+        """
+        try:
+            # Get last 50 interactions with ratings
+            rated_interactions = session.query(UserInteraction).filter(
+                and_(
+                    UserInteraction.user_id == user_id,
+                    UserInteraction.user_rating.isnot(None),
+                    UserInteraction.user_rating >= 1
+                )
+            ).order_by(desc(UserInteraction.created_at)).limit(50).all()
+
+            if len(rated_interactions) < 10:
+                self.logger.debug(f"User {user_id}: Not enough rated interactions ({len(rated_interactions)}), keeping default")
+                return 'medium'
+
+            # Strategy 1: Check for explicit signals in queries
+            from src.services.adaptive_response_engine import SentimentDetector
+            sentiment_detector = SentimentDetector()
+
+            brevity_count = 0
+            detail_count = 0
+
+            for interaction in rated_interactions:
+                analysis = sentiment_detector.analyze_query(interaction.query_text)
+                if analysis['wants_brevity']:
+                    brevity_count += 1
+                if analysis['wants_more_detail']:
+                    detail_count += 1
+
+            total_explicit = brevity_count + detail_count
+
+            # If >60% of rated interactions have explicit signals, trust those
+            if total_explicit >= len(rated_interactions) * 0.6:
+                if brevity_count > detail_count * 2:
+                    self.logger.info(f"User {user_id}: Strong brevity preference detected ({brevity_count}/{total_explicit})")
+                    return 'short'
+                elif detail_count > brevity_count * 2:
+                    self.logger.info(f"User {user_id}: Strong detail preference detected ({detail_count}/{total_explicit})")
+                    return 'long'
+
+            # Strategy 2: Analyze ratings by response length
+            # Categorize responses by character count
+            short_responses = []  # < 500 chars
+            medium_responses = []  # 500-1500 chars
+            long_responses = []  # > 1500 chars
+
+            for interaction in rated_interactions:
+                if not interaction.response_text:
+                    continue
+
+                response_len = len(interaction.response_text)
+                rating = interaction.user_rating
+
+                if response_len < 500:
+                    short_responses.append(rating)
+                elif response_len < 1500:
+                    medium_responses.append(rating)
+                else:
+                    long_responses.append(rating)
+
+            # Calculate average ratings for each category (need min 10 samples)
+            ratings_by_length = {}
+
+            if len(short_responses) >= 10:
+                ratings_by_length['short'] = sum(short_responses) / len(short_responses)
+
+            if len(medium_responses) >= 10:
+                ratings_by_length['medium'] = sum(medium_responses) / len(medium_responses)
+
+            if len(long_responses) >= 10:
+                ratings_by_length['long'] = sum(long_responses) / len(long_responses)
+
+            if not ratings_by_length:
+                self.logger.debug(f"User {user_id}: Not enough samples in any category, keeping medium")
+                return 'medium'
+
+            # Choose category with highest average rating
+            best_length = max(ratings_by_length, key=ratings_by_length.get)
+            best_rating = ratings_by_length[best_length]
+
+            self.logger.info(
+                f"User {user_id}: Response length preference updated to '{best_length}' "
+                f"(avg rating: {best_rating:.2f}, ratings by length: {ratings_by_length})"
+            )
+
+            return best_length
+
+        except Exception as e:
+            self.logger.error(f"Error updating response length preference for user {user_id}: {e}", exc_info=True)
+            return 'medium'  # Default on error
 
     def update_personalization_profile(self, user_id: int) -> Optional[PersonalizationProfile]:
         """
@@ -460,7 +740,10 @@ class PersonalizationEngine:
         return total_duration / len(closed_sessions)
 
     def _determine_learning_pace(self, user_id: int, session: Session) -> str:
-        """Determine user's learning pace (slow, medium, fast)"""
+        """
+        Determine user's learning pace (slow, medium, fast)
+        Based on interaction frequency, with rating influence
+        """
         # Calculate interactions per day over last 7 days
         week_ago = datetime.utcnow() - timedelta(days=7)
 
@@ -469,16 +752,24 @@ class PersonalizationEngine:
                 UserInteraction.user_id == user_id,
                 UserInteraction.created_at >= week_ago
             )
-        ).count()
+        ).all()
 
-        interactions_per_day = recent_interactions / 7.0
+        interactions_per_day = len(recent_interactions) / 7.0
 
+        # Base pace from interaction frequency
         if interactions_per_day < 2:
-            return "slow"
+            base_pace = "slow"
         elif interactions_per_day < 5:
-            return "medium"
+            base_pace = "medium"
         else:
-            return "fast"
+            base_pace = "fast"
+
+        # Apply rating influence to adjust pace preference
+        adjusted_pace = self._apply_pace_rating_influence(
+            base_pace, recent_interactions
+        )
+
+        return adjusted_pace
 
     def get_personalized_settings(self, user_id: int) -> Dict[str, Any]:
         """
