@@ -1100,21 +1100,30 @@ Choose a setting to modify:
             # === CENTRALIZED TOPIC EXTRACTION (Extract once, use everywhere) ===
             from src.services.adaptive_response_engine import adaptive_response_engine
 
-            # Extract topics ONCE at the beginning - this will be reused throughout
-            extracted_topics = adaptive_response_engine.topic_analyzer.extract_topics(query_text)
-            current_topic = extracted_topics[0] if extracted_topics else None
-
             with db_manager.get_session() as session:
                 user = session.query(User).filter(User.id == user_id).first()
+
+                # Get session context FIRST (needed for context-aware topic extraction)
+                conv_session = session_manager.get_or_create_session(user_id, session)
+
+                # CONTEXT-AWARE TOPIC EXTRACTION
+                # Searches conversation history for "previous", "first", "that" references
+                extracted_topics = adaptive_response_engine.topic_analyzer.extract_topics_with_context(
+                    query=query_text,
+                    user_id=user_id,
+                    session_id=current_session_id,
+                    db_session=session,
+                    conv_session=conv_session
+                )
+
+                current_topic = extracted_topics[0] if extracted_topics else None
+                # Get previous topic from session context (for confusion tracking)
+                previous_topic = conv_session.session_context.get('current_topic') if conv_session.session_context else None
 
                 # === SENTIMENT & CONFUSION DETECTION ===
                 # Analyze query for confusion/sentiment
                 sentiment_detector = adaptive_response_engine.sentiment_detector
                 sentiment_analysis = sentiment_detector.analyze_query(query_text)
-
-                # Get previous topic from session context
-                conv_session = session_manager.get_or_create_session(user_id, session)
-                previous_topic = conv_session.session_context.get('current_topic') if conv_session.session_context else None
 
                 # Log confusion event to database
                 confusion_event = sentiment_detector.log_confusion_event(
@@ -1266,10 +1275,15 @@ Choose a setting to modify:
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle callback queries from inline keyboards"""
         query = update.callback_query
-        await query.answer()  # Acknowledge the callback
-        
-        callback_data = query.data  
-        
+        callback_data = query.data
+
+        # Try to acknowledge the callback, but don't let it block functionality
+        try:
+            await asyncio.wait_for(query.answer(), timeout=3.0)
+        except (asyncio.TimeoutError, Exception) as e:
+            # Log but continue - acknowledgment is just UX, not critical
+            logger.warning(f"Failed to acknowledge callback (non-critical): {e}")
+
         try:
             if callback_data == "view_courses":
                 #await self.courses_command(update, context)

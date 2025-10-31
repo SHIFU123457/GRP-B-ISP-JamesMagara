@@ -328,31 +328,157 @@ class TopicBridgeAnalyzer:
         self.logger.info(f"Topic extraction - SUCCESS via regex fallback: {topics}")
         return topics
 
+    def extract_topics_with_context(
+        self,
+        query: str,
+        user_id: int = None,
+        session_id: str = None,
+        db_session = None,
+        conv_session = None
+    ) -> List[str]:
+        """
+        Context-aware topic extraction that searches conversation history
+
+        Handles context-referencing queries like:
+        - "Could you correct your previous answer?"
+        - "Explain your first response"
+        - "Clarify that explanation"
+
+        Args:
+            query: User's query text
+            user_id: User database ID (optional, for history search)
+            session_id: Conversation session ID (optional, for history search)
+            db_session: Database session (optional, for history queries)
+            conv_session: ConversationSession object (optional, for primary_topic)
+
+        Returns:
+            List of extracted topics, with history fallback if context query
+        """
+        # Try normal extraction first
+        topics = self.extract_topics(query)
+
+        # If we got good topics, return them
+        if topics and topics != ['general']:
+            return topics
+
+        # Check if this is a context-referencing query
+        context_patterns = {
+            'first': r'\b(first|initial|original)\s+(question|answer|response|message)',
+            'previous': r'\b(previous|last|earlier|prior)\s+(question|answer|response|message)',
+            'that': r'\b(that|the above|your)\s+(answer|response|explanation)',
+            'correct': r'\bcorrect\s+(your|the|that)\s+(answer|response|explanation)',
+            'pronoun': r'\b(explain|clarify|elaborate|tell me more about)\s+(it|that|this|them)\b',
+            'followup': r'^(explain|clarify|elaborate on|tell me more)\s+(further|more|better)',
+        }
+
+        query_lower = query.lower()
+        context_type = None
+
+        for ctype, pattern in context_patterns.items():
+            if re.search(pattern, query_lower):
+                context_type = ctype
+                self.logger.info(f"Detected {ctype}-type context reference in query")
+                break
+
+        if not context_type:
+            # Not a context query, return what we have
+            return topics
+
+        # STRATEGY 1: For "first" queries, try primary_topic (fastest)
+        if context_type == 'first' and conv_session and conv_session.primary_topic:
+            self.logger.info(f"Using primary session topic for 'first' reference: {conv_session.primary_topic}")
+            return [conv_session.primary_topic]
+
+        # STRATEGY 2: For "previous/that" queries, try session_context.current_topic
+        if context_type in ['previous', 'that', 'correct'] and conv_session:
+            if conv_session.session_context and conv_session.session_context.get('current_topic'):
+                current_topic = conv_session.session_context['current_topic']
+                self.logger.info(f"Using session_context.current_topic for '{context_type}' reference: {current_topic}")
+                return [current_topic]
+
+        # STRATEGY 3: Search conversation history (most accurate but slower)
+        if user_id and session_id and db_session:
+            try:
+                from src.services.personalization_engine import session_manager
+
+                # Retrieve conversation history
+                history = session_manager.get_conversation_history(
+                    user_id=user_id,
+                    db_session=db_session,
+                    limit=10,  # Last 10 messages
+                    session_id=session_id
+                )
+
+                if history:
+                    # Determine which message to extract from
+                    if context_type == 'first':
+                        target_message = history[0]  # First message in session
+                        msg_desc = "first"
+                    else:  # previous, that, correct
+                        target_message = history[-1]  # Most recent message
+                        msg_desc = "previous"
+
+                    # Extract topics from the target message's query
+                    inherited_topics = self.extract_topics(target_message['query'])
+
+                    if inherited_topics and inherited_topics != ['general']:
+                        self.logger.info(f"Inherited topics from {msg_desc} message in history: {inherited_topics}")
+                        return inherited_topics
+                    else:
+                        self.logger.warning(f"Could not extract topics from {msg_desc} message: {target_message['query'][:80]}")
+
+            except Exception as e:
+                self.logger.warning(f"Failed to search conversation history: {e}")
+
+        # STRATEGY 4: Fallback to primary_topic as last resort
+        if conv_session and conv_session.primary_topic:
+            self.logger.info(f"Fallback to primary session topic: {conv_session.primary_topic}")
+            return [conv_session.primary_topic]
+
+        # No context available, return original extraction result
+        self.logger.warning("Context query detected but no history/context available")
+        return topics
+
     def _extract_topics_llm(self, query: str) -> List[str]:
         """
         Layer 1: Extract topics using LLM
         Most accurate but may refuse on sensitive topics
         """
+        # CRITICAL FIX: Detect context-referencing queries that lack concrete topics
+        # These queries reference previous conversation ("previous question", "that answer", "above")
+        # Small LLMs hallucinate topics from examples instead of extracting from vague queries
+        context_reference_patterns = [
+            r'\b(previous|earlier|above|prior|last|that)\s+(question|answer|response|explanation|query)',
+            r'\b(your|the)\s+(previous|earlier|above|prior|last)\s+',
+            r'\b(correct|fix|improve|clarify)\s+(your|the|that)\s+(answer|response|explanation)',
+            r'\bbased\s+off\s+(this|that)\s+knowledge\b',
+            r'\bas\s+I\s+(said|mentioned|asked)\s+',
+        ]
+
+        query_lower = query.lower()
+        is_context_query = any(re.search(pattern, query_lower) for pattern in context_reference_patterns)
+
+        if is_context_query:
+            # Skip LLM extraction for context-referencing queries
+            # LLM will hallucinate topics from examples instead of extracting from vague query
+            self.logger.info(f"Topic extraction - Skipping LLM for context-referencing query: '{query[:80]}'")
+            return []  # Let orchestrator try other layers
+
         try:
             # Use LLM to extract topics with clearer, more flexible formatting instructions
             # Added educational context to prevent safety refusals on any academic topics
-            prompt = f"""SYSTEM: You are an educational assistant helping students with their coursework. This is for academic study and research purposes.
+            # REMOVED EXAMPLES to prevent contamination from small models copying them
+            prompt = f"""SYSTEM: You are a topic extraction tool. Extract ONLY the main academic topics/concepts mentioned in the query.
 
-TASK: Extract 1-3 main topics or concepts from the student's question below. Return ONLY the topic names, nothing else.
-
-FORMAT: Respond in any of these ways:
-- Topics separated by commas (e.g., "Enron, Tuskys, corporate governance")
-- One topic per line
-- Topics separated by spaces
-
-EXAMPLES:
-- "Compare Enron and WorldCom" → "Enron, WorldCom, corporate governance"
-- "Explain DNA replication" → "DNA replication, molecular biology"
-- "What are Linux distributions" → "Linux distributions, operating systems"
+CRITICAL RULES:
+1. Extract topics that are EXPLICITLY mentioned in the query
+2. DO NOT infer topics from context or previous conversations
+3. If the query is vague or refers to "previous question", return "UNABLE_TO_EXTRACT"
+4. Return ONLY topic names, NO explanations or commentary
 
 STUDENT QUESTION: "{query}"
 
-TOPICS:"""
+TOPICS (comma-separated):"""
 
             # Get LLM response
             llm_response = self.llm_service.generate_response(
@@ -460,7 +586,8 @@ TOPICS:"""
 
             # Filter out garbage topics (more lenient filtering)
             filtered_topics = []
-            garbage_keywords = ['listed', 'one per line', 'underlying', 'its']  # Removed 'techniques', 'concepts' - they can be valid topics
+            garbage_keywords = ['listed', 'one per line', 'underlying', 'its', 'unable_to_extract', 'i can assist']
+
             for topic in topics:
                 # Skip if topic is just a garbage word
                 if any(garbage in topic.lower() for garbage in garbage_keywords):
@@ -470,9 +597,31 @@ TOPICS:"""
                     continue
                 filtered_topics.append(topic)
 
-            if filtered_topics:
-                self.logger.info(f"Topic extraction - SUCCESS via LLM: {filtered_topics}")
-                return filtered_topics
+            # CRITICAL: Validate that topics actually appear in the query
+            # This prevents LLM from hallucinating topics from examples or previous context
+            query_lower = query.lower()
+            validated_topics = []
+
+            for topic in filtered_topics:
+                topic_words = topic.lower().split()
+
+                # Check if ANY significant word from topic appears in query
+                # Significant = more than 3 characters
+                significant_words = [w for w in topic_words if len(w) > 3]
+
+                if significant_words:
+                    # At least one significant word must appear in query
+                    if any(word in query_lower for word in significant_words):
+                        validated_topics.append(topic)
+                    else:
+                        self.logger.warning(f"Topic extraction - REJECTED hallucinated topic not in query: '{topic}'")
+                else:
+                    # Topic has no significant words, keep it (e.g., "DNA", "SQL")
+                    validated_topics.append(topic)
+
+            if validated_topics:
+                self.logger.info(f"Topic extraction - SUCCESS via LLM: {validated_topics}")
+                return validated_topics
             else:
                 self.logger.warning(f"Topic extraction - LLM returned garbage")
                 self.logger.warning(f"Topic extraction - Unfiltered topics were: {topics}")
