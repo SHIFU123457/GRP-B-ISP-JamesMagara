@@ -10,6 +10,13 @@ class Settings:
     # Telegram Bot Settings
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_WEBHOOK_URL: Optional[str] = os.getenv("TELEGRAM_WEBHOOK_URL")
+
+    # Telegram Network Settings
+    TELEGRAM_PROXY_URL: Optional[str] = os.getenv("TELEGRAM_PROXY_URL")  # e.g., "http://proxy:port" or "socks5://proxy:port"
+    TELEGRAM_CONNECT_TIMEOUT: float = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "60.0"))
+    TELEGRAM_READ_TIMEOUT: float = float(os.getenv("TELEGRAM_READ_TIMEOUT", "60.0"))
+    TELEGRAM_WRITE_TIMEOUT: float = float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "60.0"))
+    TELEGRAM_POOL_TIMEOUT: float = float(os.getenv("TELEGRAM_POOL_TIMEOUT", "10.0"))
     
     # Database Settings
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")   
@@ -18,7 +25,7 @@ class Settings:
     MODEL_NAME: str = os.getenv("MODEL_NAME", "meta-llama/Llama-2-7b-chat-hf")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     VECTOR_STORE_PATH: str = os.getenv("VECTOR_STORE_PATH", "./data/vector_store")
-    MAX_CONTEXT_LENGTH: int = int(os.getenv("MAX_CONTEXT_LENGTH", "4096"))
+    MAX_CONTEXT_LENGTH: int = int(os.getenv("MAX_CONTEXT_LENGTH", "8192"))
     
     # LMS Settings
     MOODLE_BASE_URL: Optional[str] = os.getenv("MOODLE_BASE_URL")
@@ -36,15 +43,16 @@ class Settings:
     # Personalization Settings
     MIN_INTERACTIONS_FOR_PERSONALIZATION: int = int(os.getenv("MIN_INTERACTIONS_FOR_PERSONALIZATION", "5"))
     LEARNING_STYLE_UPDATE_INTERVAL: int = int(os.getenv("LEARNING_STYLE_UPDATE_INTERVAL", "24"))
+    SESSION_TIMEOUT_MINUTES: int = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))  # Conversation session timeout
 
     # RAG Pipeline Settings
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "300"))  # words per chunk (optimized)
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "75"))  # overlap words (increased)
     TOP_K_RETRIEVAL: int = int(os.getenv("TOP_K_RETRIEVAL", "20"))  # chunks to retrieve (increased for comprehensive responses)
     SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.25"))  # minimum similarity (lowered for better recall)
-    CONTEXT_MAX_LENGTH: int = int(os.getenv("CONTEXT_MAX_LENGTH", "4000"))  # max context length for LLM (increased)
+    CONTEXT_MAX_LENGTH: int = int(os.getenv("CONTEXT_MAX_LENGTH", "8000"))  # max context length for LLM (increased)
     HIGH_QUALITY_THRESHOLD: float = float(os.getenv("HIGH_QUALITY_THRESHOLD", "0.3"))  # threshold for quality filtering
-    MAX_RESPONSE_LENGTH: int = int(os.getenv("MAX_RESPONSE_LENGTH", "4000"))  # max LLM response length in characters
+    MAX_RESPONSE_LENGTH: int = int(os.getenv("MAX_RESPONSE_LENGTH", "8000"))  # max LLM response length in characters
 
     # Document Processing Settings
     SUPPORTED_FILE_TYPES: list = ["pdf", "docx", "txt", "doc", "pptx", "ppt"]

@@ -19,9 +19,10 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     
     # Learning preferences (will be updated by personalization engine)
-    learning_style = Column(String, default="adaptive")  # visual, auditory, kinesthetic, adaptive
+    learning_style = Column(String, default="adaptive")  # example_driven, analogy_driven, socratic, theory_first, adaptive
     difficulty_preference = Column(String, default="medium")  # easy, medium, hard
     interaction_frequency = Column(Float, default=0.0)  # interactions per day
+    last_style_classification = Column(DateTime(timezone=True))  # When learning style was last classified
 
     # OAuth credentials (encrypted JSON)
     google_credentials = Column(Text)  # Store encrypted Google OAuth credentials
@@ -239,32 +240,34 @@ class DocumentEmbedding(Base):
 class UserInteraction(Base):
     """Track user interactions for personalization"""
     __tablename__ = "user_interactions"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    
+    session_id = Column(String, ForeignKey("conversation_sessions.session_id"), index=True)  # Link to conversation session
+
     # Interaction details
     query_text = Column(Text, nullable=False)
     response_text = Column(Text)
     interaction_type = Column(String)  # question, feedback, command
-    
+
     # Context
     course_context = Column(String)  # which course was being discussed
     documents_referenced = Column(JSON)  # list of document IDs used in response
-    
+
     # User feedback
     user_rating = Column(Integer)  # 1-5 rating of response quality
     was_helpful = Column(Boolean)
-    
+
     # Performance metrics
     response_time_ms = Column(Integer)
     tokens_used = Column(Integer)
-    
+
     # Metadata
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
+
     # Relationships
     user = relationship("User", back_populates="interactions")
+    conversation_session = relationship("ConversationSession", backref="interactions")
 
 class SystemLog(Base):
     """System logs for monitoring and debugging"""
@@ -342,3 +345,110 @@ class QuizSession(Base):
     # Relationships
     user = relationship("User")
     document = relationship("Document")
+
+class ConversationSession(Base):
+    """Track conversation sessions for context continuity and personalization"""
+    __tablename__ = "conversation_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    session_id = Column(String, unique=True, index=True, nullable=False)  # UUID for session tracking
+
+    # Session state
+    is_active = Column(Boolean, default=True, index=True)
+    session_context = Column(JSON, default=lambda: {})  # Store conversation context (topics, current course, etc.)
+
+    # Session analytics
+    message_count = Column(Integer, default=0)
+    questions_asked = Column(Integer, default=0)
+    commands_used = Column(Integer, default=0)
+
+    # Temporal tracking
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_activity_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    ended_at = Column(DateTime(timezone=True))
+
+    # Session metadata
+    session_duration_minutes = Column(Float, default=0.0)  # Calculated on session end
+    primary_topic = Column(String)  # Main topic discussed in this session
+    courses_discussed = Column(JSON, default=lambda: [])  # List of course IDs mentioned
+
+    # Relationships
+    user = relationship("User")
+
+class ConfusionEvent(Base):
+    """Track sentiment and confusion detection events"""
+    __tablename__ = "confusion_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    session_id = Column(String, ForeignKey("conversation_sessions.session_id"), index=True)
+    interaction_id = Column(Integer, ForeignKey("user_interactions.id"))
+
+    # Confusion details
+    confusion_score = Column(Float, nullable=False)  # 0.0-1.0
+    confusion_type = Column(String, nullable=False)  # 'none', 'mild', 'moderate', 'severe'
+    confidence = Column(Float, default=0.8)  # Confidence in the detection
+
+    # Detection signals
+    indicators = Column(JSON)  # List of detected signals: ['explicit_confusion', 'low_ratings', etc.]
+    detected_patterns = Column(JSON)  # Specific patterns matched: ['still_dont_understand', etc.]
+
+    # Context
+    query_text = Column(Text)  # The query that triggered detection
+    topic = Column(String)  # Topic being discussed
+    previous_topic = Column(String)  # Topic from previous query (for repetition detection)
+
+    # Sentiment indicators
+    wants_more_detail = Column(Boolean, default=False)
+    wants_brevity = Column(Boolean, default=False)
+
+    # Metadata
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    # Relationships
+    user = relationship("User")
+
+class StruggleTopic(Base):
+    """Track topics user is struggling with (persistent tracking)"""
+    __tablename__ = "struggle_topics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    # Topic details
+    topic = Column(String, nullable=False, index=True)  # Topic name (normalized)
+    topic_aliases = Column(JSON)  # Other names for same topic: ['recursion', 'recursive functions']
+
+    # Struggle metrics
+    struggle_score = Column(Float, nullable=False)  # 0.0-1.0 overall struggle intensity
+    query_count = Column(Integer, default=1)  # Number of queries about this topic
+    confusion_count = Column(Integer, default=0)  # Times user was confused on this topic
+
+    # Rating context
+    avg_rating = Column(Float)  # Average rating for interactions on this topic
+    low_rating_count = Column(Integer, default=0)  # Count of ratings < 3
+
+    # Progression tracking
+    complexity_trend = Column(String)  # 'increasing', 'flat', 'decreasing'
+    first_query_complexity = Column(Float)  # Complexity of first query (0-1)
+    latest_query_complexity = Column(Float)  # Complexity of latest query (0-1)
+
+    # Indicators
+    indicators = Column(JSON)  # Detected struggle signals: ['high_frequency', 'low_ratings', etc.]
+
+    # Temporal tracking
+    first_asked_at = Column(DateTime(timezone=True), nullable=False)
+    last_asked_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    resolution_detected_at = Column(DateTime(timezone=True))  # When struggle appeared to resolve
+
+    # Status
+    is_active = Column(Boolean, default=True, index=True)  # False if struggle appears resolved
+    is_resolved = Column(Boolean, default=False)
+
+    # Metadata
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # Relationships
+    user = relationship("User")

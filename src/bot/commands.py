@@ -521,7 +521,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 Customize your Study Helper Agent experience:
 
-• **Learning Style**: How you prefer to learn (visual, auditory, etc.)
+• **Learning Style**: How you prefer to learn (example-driven, socratic, etc.)
 • **Difficulty Level**: Complexity of explanations you prefer  
 • **Notifications**: When to receive updates about new content
 • **Response Length**: How detailed you want my responses

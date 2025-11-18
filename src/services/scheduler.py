@@ -172,6 +172,9 @@ class SchedulerService:
         sync_interval = getattr(settings, 'LMS_SYNC_INTERVAL_MINUTES', 720)
         schedule.every(sync_interval).minutes.do(self._sync_lms_content)
 
+        # Schedule learning style reclassification every 12 hours (aligned with LMS sync)
+        schedule.every(12).hours.do(self._reclassify_learning_styles)
+
         # Schedule document processing every 3 minutes
         schedule.every(3).minutes.do(self._process_pending_documents)
 
@@ -181,7 +184,7 @@ class SchedulerService:
         # Schedule weekly full sync every Sunday at 3 AM
         schedule.every().sunday.at("03:00").do(self._weekly_full_sync)
 
-        logger.info(f"Scheduled tasks configured - Gmail check every 2 min, LMS sync every {sync_interval} hrs")
+        logger.info(f"Scheduled tasks configured - Gmail check every 2 min, LMS sync & style reclassification every 12 hrs")
     
     def _run_scheduler(self):
         """Run the scheduler loop"""
@@ -626,21 +629,173 @@ class SchedulerService:
         """Perform weekly full synchronization"""
         try:
             logger.info("Starting weekly full sync...")
-            
+
             # Force a complete sync of all LMS content
             stats = lms_service.sync_all_materials()
-            
+
             # Get RAG pipeline statistics
             if self.rag_pipeline:
                 rag_stats = self.rag_pipeline.get_vector_store_stats()
                 logger.info(f"Vector store stats: {rag_stats}")
-            
+
             # Log sync summary
             logger.info(f"Weekly sync completed - Courses: {stats['courses_synced']}, Documents: {stats['documents_synced']}")
-            
+
         except Exception as e:
             logger.error(f"Error during weekly full sync: {e}")
-    
+
+    def _reclassify_learning_styles(self):
+        """
+        Reclassify learning styles AND response length preferences for all active users (runs every 12 hours)
+
+        This task:
+        1. Analyzes each user's last 30 interactions and updates their learning style
+        2. Analyzes each user's last 50 rated interactions and updates response length preference
+        """
+        try:
+            logger.info("🎓 Starting scheduled personalization reclassification...")
+
+            from src.data.models import UserInteraction, PersonalizationProfile
+            from src.services.explanation_style_engine import explanation_style_engine
+            from src.services.personalization_engine import personalization_engine
+
+            with db_manager.get_session() as session:
+                # Get all users who have interacted in the last 30 days
+                cutoff_date = datetime.now() - timedelta(days=30)
+
+                # Query users with recent interactions
+                active_user_ids = session.query(UserInteraction.user_id).filter(
+                    UserInteraction.created_at >= cutoff_date
+                ).distinct().all()
+
+                active_user_ids = [uid[0] for uid in active_user_ids]  # Extract IDs from tuples
+
+                if not active_user_ids:
+                    logger.info("No active users found for reclassification")
+                    return
+
+                logger.info(f"Reclassifying personalization for {len(active_user_ids)} active users...")
+
+                reclassified_count = 0
+                style_changes = []
+                length_changes = []
+
+                for user_id in active_user_ids:
+                    try:
+                        # Get user and profile
+                        user = session.query(User).filter(User.id == user_id).first()
+                        if not user:
+                            continue
+
+                        profile = session.query(PersonalizationProfile).filter(
+                            PersonalizationProfile.user_id == user_id
+                        ).first()
+
+                        # === 1. Reclassify learning style ===
+                        old_style = user.learning_style
+
+                        new_style, scores = explanation_style_engine.get_user_learning_style(
+                            user_id, session, force_reclassify=True
+                        )
+
+                        if old_style != new_style:
+                            style_changes.append({
+                                'user_id': user_id,
+                                'old_style': old_style,
+                                'new_style': new_style,
+                                'scores': scores
+                            })
+                            logger.info(f"📊 User {user_id} learning style: {old_style} → {new_style}")
+
+                        # === 2. Reclassify response length preference ===
+                        old_length = profile.preferred_response_length if profile else 'medium'
+
+                        new_length = personalization_engine.update_response_length_preference(
+                            user_id, session
+                        )
+
+                        # Update profile
+                        if profile:
+                            profile.preferred_response_length = new_length
+                            session.commit()
+                        else:
+                            # Create profile if doesn't exist
+                            new_profile = PersonalizationProfile(
+                                user_id=user_id,
+                                preferred_response_length=new_length
+                            )
+                            session.add(new_profile)
+                            session.commit()
+
+                        if old_length != new_length:
+                            length_changes.append({
+                                'user_id': user_id,
+                                'old_length': old_length,
+                                'new_length': new_length
+                            })
+                            logger.info(f"📏 User {user_id} response length: {old_length} → {new_length}")
+
+                        # === 3. Update Question Complexity Level ===
+                        interactions_for_complexity = session.query(UserInteraction).filter(
+                            and_(
+                                UserInteraction.user_id == user_id,
+                                UserInteraction.interaction_type == 'question'
+                            )
+                        ).order_by(desc(UserInteraction.created_at)).limit(50).all()
+
+                        new_complexity = personalization_engine._estimate_question_complexity(interactions_for_complexity)
+                        old_complexity = profile.question_complexity_level if profile else 0.5
+
+                        if profile:
+                            profile.question_complexity_level = new_complexity
+                            session.commit()
+
+                        # Log significant changes (>0.1 difference)
+                        if abs(new_complexity - old_complexity) > 0.1:
+                            logger.info(f"🧠 User {user_id} complexity: {old_complexity:.2f} → {new_complexity:.2f}")
+
+                        # === 4. Update Learning Pace ===
+                        new_pace = personalization_engine._determine_learning_pace(user_id, session)
+                        old_pace = profile.learning_pace if profile else 'medium'
+
+                        if profile:
+                            profile.learning_pace = new_pace
+                            session.commit()
+
+                        if old_pace != new_pace:
+                            logger.info(f"⚡ User {user_id} learning pace: {old_pace} → {new_pace}")
+
+                        reclassified_count += 1
+
+                    except Exception as e:
+                        logger.error(f"Error reclassifying user {user_id}: {e}")
+                        continue
+
+                # Log summary
+                logger.info(
+                    f"✅ Personalization reclassification completed:\n"
+                    f"   - {reclassified_count} users processed\n"
+                    f"   - {len(style_changes)} learning style changes\n"
+                    f"   - {len(length_changes)} response length changes"
+                )
+
+                # Log detailed changes
+                if style_changes:
+                    for change in style_changes[:10]:  # Show first 10 changes
+                        logger.debug(
+                            f"  User {change['user_id']}: {change['old_style']} → {change['new_style']} "
+                            f"(scores: {change['scores']})"
+                        )
+
+                if length_changes:
+                    for change in length_changes[:10]:  # Show first 10 changes
+                        logger.debug(
+                            f"  User {change['user_id']}: {change['old_length']} → {change['new_length']}"
+                        )
+
+        except Exception as e:
+            logger.error(f"❌ Error in learning style reclassification task: {e}", exc_info=True)
+
     def force_sync_now(self) -> Dict[str, Any]:
         """Force an immediate sync (useful for testing or manual triggers)"""
         try:

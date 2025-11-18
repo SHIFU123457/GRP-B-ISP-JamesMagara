@@ -1164,9 +1164,80 @@ class LMSIntegrationService:
                     Course.lms_platform == 'google_classroom'
                 ).all()
 
+                # If no enrollments found in DB, fetch courses from Google Classroom API
                 if not enrollments:
-                    logger.warning(f"No Google Classroom courses found for user {user_id}")
-                    return stats
+                    logger.info(f"No Google Classroom courses in DB for user {user_id}. Fetching from API...")
+
+                    try:
+                        # Fetch courses from Google Classroom API
+                        google_courses = connector.get_user_courses()
+
+                        if not google_courses:
+                            logger.warning(f"User {user_id} has no Google Classroom courses available from API. "
+                                         f"Material '{course_name_hint or 'Unknown'}' cannot be synced.")
+                            return stats
+
+                        logger.info(f"Found {len(google_courses)} courses from Google Classroom API for user {user_id}")
+
+                        # Create Course and CourseEnrollment records
+                        created_courses = []
+                        for course_data in google_courses:
+                            # Check if course already exists (by LMS ID)
+                            existing_course = session.query(Course).filter(
+                                Course.lms_course_id == course_data['id'],
+                                Course.lms_platform == 'google_classroom'
+                            ).first()
+
+                            if existing_course:
+                                course = existing_course
+                                logger.debug(f"Course '{course.course_name}' already exists in DB")
+                            else:
+                                # Create new course
+                                course = Course(
+                                    course_code=course_data.get('section', course_data['name'][:20]),
+                                    course_name=course_data['name'],
+                                    description=course_data.get('descriptionHeading', ''),
+                                    lms_course_id=course_data['id'],
+                                    lms_platform='google_classroom',
+                                    year=datetime.now().year,
+                                    semester=self._determine_semester(),
+                                    is_active=True
+                                )
+                                session.add(course)
+                                session.flush()
+                                logger.info(f"Created new course: '{course.course_name}' (ID: {course.id})")
+
+                            # Ensure user is enrolled
+                            enrollment = session.query(CourseEnrollment).filter(
+                                CourseEnrollment.user_id == user_id,
+                                CourseEnrollment.course_id == course.id
+                            ).first()
+
+                            if not enrollment:
+                                enrollment = CourseEnrollment(
+                                    user_id=user_id,
+                                    course_id=course.id,
+                                    enrollment_date=datetime.now(),
+                                    is_active=True
+                                )
+                                session.add(enrollment)
+                                logger.info(f"Enrolled user {user_id} in course '{course.course_name}'")
+
+                            created_courses.append(course)
+
+                        session.commit()
+
+                        # Now use the newly created courses
+                        enrollments = session.query(CourseEnrollment).filter(
+                            CourseEnrollment.user_id == user_id,
+                            CourseEnrollment.is_active == True
+                        ).join(Course).filter(
+                            Course.lms_platform == 'google_classroom'
+                        ).all()
+
+                    except Exception as fetch_error:
+                        logger.error(f"Failed to fetch courses from Google Classroom API for user {user_id}: {fetch_error}")
+                        return stats
 
                 # Try to match course by name hint if provided
                 target_courses = []
@@ -1180,7 +1251,8 @@ class LMSIntegrationService:
                             logger.debug(f"Matched course '{course.course_name}' with hint '{course_name_hint}'")
 
                     if not target_courses:
-                        logger.warning(f"Could not match course hint '{course_name_hint}' for user {user_id}")
+                        logger.warning(f"Could not match course hint '{course_name_hint}' for user {user_id}. "
+                                     f"Available courses: {', '.join([e.course.course_name for e in enrollments])}")
                         # Fall back to syncing all courses
                         target_courses = [e.course for e in enrollments]
                 else:
