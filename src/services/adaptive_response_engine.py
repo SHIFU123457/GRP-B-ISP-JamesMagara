@@ -357,18 +357,44 @@ class TopicBridgeAnalyzer:
         # Try normal extraction first
         topics = self.extract_topics(query)
 
-        # If we got good topics, return them
+        # Validate topic quality before accepting
+        # Reject topics that are just instructions/methods, not actual subjects
+        garbage_indicators = ['describe', 'explain', 'clarify', 'elaborate', 'tell me', 'using', 'further', 'more', 'better', 'analogy']
+
+        is_garbage = False
         if topics and topics != ['general']:
+            # Check if ALL topics are garbage
+            non_garbage_count = 0
+            for topic in topics:
+                topic_words = topic.lower().split()
+                # Topic is garbage if it's entirely composed of instruction/method words
+                if not all(word in garbage_indicators for word in topic_words):
+                    non_garbage_count += 1
+
+            if non_garbage_count == 0:
+                is_garbage = True
+                self.logger.info(f"Rejecting garbage topics (all are instructions/methods): {topics}")
+
+        # If we got good topics, return them
+        if topics and topics != ['general'] and not is_garbage:
             return topics
 
         # Check if this is a context-referencing query
+        # ONLY trigger if we couldn't extract meaningful topics
+        # These patterns detect backward references to previous conversation
         context_patterns = {
             'first': r'\b(first|initial|original)\s+(question|answer|response|message)',
             'previous': r'\b(previous|last|earlier|prior)\s+(question|answer|response|message)',
             'that': r'\b(that|the above|your)\s+(answer|response|explanation)',
             'correct': r'\bcorrect\s+(your|the|that)\s+(answer|response|explanation)',
-            'pronoun': r'\b(explain|clarify|elaborate|tell me more about)\s+(it|that|this|them)\b',
-            'followup': r'^(explain|clarify|elaborate on|tell me more)\s+(further|more|better)',
+            # Pronoun references without named subject: "explain it", "describe this"
+            'pronoun': r'\b(explain|clarify|elaborate|tell me more about|describe)\s+(it|that|this|them)(?!\s+\w+)',
+            # Followup requests: "explain further", "tell me more"
+            'followup': r'\b(explain|clarify|elaborate|tell me|describe)\s+(further|more|better)',
+            # Meta-understanding: "I haven't understood..."
+            'meta_confusion': r'\b(haven\'t|havent|don\'t|dont|do\s+not)\s+(understood|understand|get|follow|grasp)\b',
+            # Process questions: "how did you achieve/calculate X"
+            'process': r'\b(how|why)\s+(did\s+you|have\s+you|you\'ve|youve)\s+(manage|achieve|calculate|get|reach)',
         }
 
         query_lower = query.lower()

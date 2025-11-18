@@ -41,12 +41,31 @@ class StudyHelperBot:
         self._start_notification_handler()
     
     def _setup_application(self):
-        """Initialize the bot application"""
-        self.application = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
-        
+        """Initialize the bot application with network configuration"""
+        from telegram.request import HTTPXRequest
+
+        # Log proxy usage
+        if settings.TELEGRAM_PROXY_URL:
+            logger.info(f"Using proxy: {settings.TELEGRAM_PROXY_URL}")
+
+        # Create HTTPXRequest with timeouts and optional proxy
+        request = HTTPXRequest(
+            connect_timeout=settings.TELEGRAM_CONNECT_TIMEOUT,
+            read_timeout=settings.TELEGRAM_READ_TIMEOUT,
+            write_timeout=settings.TELEGRAM_WRITE_TIMEOUT,
+            pool_timeout=settings.TELEGRAM_POOL_TIMEOUT,
+            proxy=settings.TELEGRAM_PROXY_URL,  # None if not set
+            http_version="1.1"
+        )
+
+        self.application = Application.builder()\
+            .token(settings.TELEGRAM_BOT_TOKEN)\
+            .request(request)\
+            .build()
+
         # Add handlers
         self._add_handlers()
-        logger.info("Telegram bot application initialized")
+        logger.info("Telegram bot application initialized with network settings")
         
     def _initialize_rag(self):
         """Initialize the RAG pipeline"""
@@ -1775,10 +1794,20 @@ Choose a setting to modify:
                 user_preferences=user_preferences,
                 pre_extracted_topics=pre_extracted_topics  # Pass topics to avoid re-extraction
             )
-            
+
+            # Log query rewriting if it occurred
+            if rag_result.get('query_rewritten'):
+                logger.info(
+                    f"📝 Query context resolution:\n"
+                    f"  User query: '{rag_result.get('original_query', query)}'\n"
+                    f"  Expanded to: '{rag_result.get('rewritten_query', query)}'\n"
+                    f"  Context source: {rag_result.get('rewrite_context_source', 'unknown')}\n"
+                    f"  Similarity improved to: {rag_result.get('average_similarity', 0)*100:.1f}%"
+                )
+
             # Format the response with sources and confidence indicator
             response = self._format_rag_response(rag_result, user)
-            
+
             return response
             
         except Exception as e:
@@ -1867,34 +1896,30 @@ Choose a setting to modify:
         return None
 
     def _extract_course_context(self, query: str, user: User) -> Optional[int]:
-        """Extract course context from query"""
+        """
+        Extract course context from query if explicitly mentioned
+
+        Returns course_id only if user explicitly mentions a course code
+        (e.g., "ICS201", "MAT201"). Otherwise returns None to search all courses.
+
+        Note: Removed buggy keyword matching that caused false positives
+        (e.g., 'logic' matching 'biological'). RAG semantic search handles
+        topic-based filtering better than hardcoded keywords.
+        """
         query_lower = query.lower()
-        
-        # Look for explicit course mentions
-        course_keywords = {
-            'ics201': {'data structures', 'algorithms', 'programming'},
-            'ics301': {'software engineering', 'design patterns', 'uml'},
-            'mat201': {'discrete math', 'logic', 'proofs'},
-            'ics401': {'machine learning', 'ai', 'neural networks'}
-        }
-        
-        # Try to match based on course codes first
-        for course_code, topics in course_keywords.items():
-            if course_code in query_lower:
-                # Look up course ID from database
-                with db_manager.get_session() as session:
-                    course = session.query(Course).filter(Course.course_code.ilike(f"%{course_code}%")).first()
-                    if course:
-                        return course.id
-            
-            # Try to match based on topic keywords
-            if any(topic in query_lower for topic in topics):
-                with db_manager.get_session() as session:
-                    course = session.query(Course).filter(Course.course_code.ilike(f"%{course_code}%")).first()
-                    if course:
-                        return course.id
-        
-        # If no explicit course found, return None. The automatic fallback has been removed.
+
+        # Only match explicit course code mentions (e.g., "ics201", "mat201")
+        # This prevents false matches and lets RAG handle topic-based filtering
+        with db_manager.get_session() as session:
+            courses = session.query(Course).all()
+            for course in courses:
+                # Check if course code appears as standalone word
+                course_code_lower = course.course_code.lower()
+                if course_code_lower in query_lower:
+                    logger.info(f"Explicit course code '{course.course_code}' mentioned in query")
+                    return course.id
+
+        # No explicit course mentioned - search all courses (better for accuracy)
         return None
 
     async def _generate_rag_response(self, query: str, rag_context: Dict[str, Any], user: User) -> str:
@@ -3208,11 +3233,22 @@ Use /help for available commands!
 
         except asyncio.CancelledError:
             logger.info("Bot run cancelled")
+        except Exception as e:
+            logger.error(f"Error during bot execution: {e}", exc_info=True)
         finally:
             # Cleanup
             logger.info("Stopping bot...")
-            if self.application.updater.running:
-                await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
-            logger.info("Bot stopped successfully")
+            try:
+                # Stop updater if it's running
+                if self.application.updater and self.application.updater.running:
+                    await self.application.updater.stop()
+
+                # Stop application only if it's running
+                if self.application.running:
+                    await self.application.stop()
+
+                # Always shutdown to clean up resources
+                await self.application.shutdown()
+                logger.info("Bot stopped successfully")
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup: {cleanup_error}", exc_info=True)

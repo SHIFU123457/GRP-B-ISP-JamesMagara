@@ -13,10 +13,11 @@ import time
 
 from config.settings import settings
 from config.database import db_manager
-from src.data.models import Document, DocumentEmbedding, DocumentAccess
+from src.data.models import Document, DocumentEmbedding, DocumentAccess, ConversationSession
 from src.services.document_processor import DocumentProcessor
 from src.services.llm_integration import LLMService
 from src.services.adaptive_response_engine import adaptive_response_engine
+from src.services.query_rewriter import QueryRewriter
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +48,15 @@ class RAGPipeline:
     def __init__(self):
         self.embedding_model_name = settings.EMBEDDING_MODEL
         self.vector_store_path = settings.VECTOR_STORE_PATH
-        
+
         # Initialize components
         self.embedding_model = None
         self.vector_store = None
         self.collection = None
         self.document_processor = DocumentProcessor()
         self.llm_service = None
-        
+        self.query_rewriter = QueryRewriter()  # NEW: Query rewriter for context-aware retrieval
+
         self._initialize_components()
     
     def _initialize_components(self):
@@ -529,10 +531,12 @@ class RAGPipeline:
     def generate_rag_response(self, query: str, user_id: int, course_id: Optional[int] = None, document_id: Optional[int] = None, user_preferences: Dict[str, Any] = None, pre_extracted_topics: Optional[List[str]] = None) -> Dict[str, Any]:
         """Generate complete RAG response using LLM with retrieved context
 
-        Strategy: RAG-first approach
+        Strategy: RAG-first approach with context-aware query rewriting
         1. Check for obvious non-educational queries (greetings, chitchat)
-        2. Always attempt RAG retrieval for everything else
-        3. If similarity < 10%, fall back to generic LLM
+        2. Get conversation history for context
+        3. Rewrite vague/follow-up queries using conversation context
+        4. Retrieve relevant documents using rewritten query
+        5. If similarity < 10%, fall back to generic LLM
 
         Args:
             query: User's query text
@@ -558,9 +562,58 @@ class RAGPipeline:
                     'reason': 'chitchat'
                 }
 
-            # For all other queries: Always try RAG first
-            logger.info(f"Searching course materials for: '{query[:50]}...'")
-            context_data = self.generate_context(query, user_id, course_id, document_id)
+            # CRITICAL FIX: Get conversation history and session context BEFORE retrieval
+            conversation_history = []
+            conv_session = None
+            session_context = {}
+
+            try:
+                with db_manager.get_session() as session:
+                    from src.services.personalization_engine import session_manager
+
+                    # Get conversation history
+                    conversation_history = session_manager.get_conversation_history(
+                        user_id=user_id,
+                        db_session=session,
+                        limit=5  # Last 5 turns for context
+                    )
+
+                    # Get conversation session for primary_topic
+                    conv_session = session_manager.get_or_create_session(user_id, session)
+
+                    if conv_session:
+                        session_context = {
+                            'primary_topic': conv_session.primary_topic,
+                            'courses_discussed': conv_session.courses_discussed if hasattr(conv_session, 'courses_discussed') else []
+                        }
+
+                    logger.debug(f"Retrieved {len(conversation_history)} conversation turns for context")
+
+            except Exception as history_error:
+                logger.warning(f"Could not retrieve conversation history: {history_error}")
+
+            # CRITICAL FIX: Rewrite query using conversation context BEFORE retrieval
+            rewritten_query, rewrite_metadata = self.query_rewriter.rewrite_with_context(
+                current_query=query,
+                conversation_history=conversation_history,
+                session_context=session_context
+            )
+
+            # Log query rewriting
+            if rewrite_metadata['is_followup']:
+                context_info = rewrite_metadata.get('context_snippet', rewrite_metadata.get('context_topic', 'none'))
+                logger.info(
+                    f"✨ Query rewritten for better retrieval:\n"
+                    f"  Original: '{query}'\n"
+                    f"  Rewritten: '{rewritten_query[:100]}...'\n"
+                    f"  Context type: {rewrite_metadata.get('context_type', 'unknown')}\n"
+                    f"  Context source: {rewrite_metadata.get('context_source', 'none')}\n"
+                    f"  Context info: {context_info if isinstance(context_info, str) else str(context_info)[:100]}..."
+                )
+
+            # For all queries: Use rewritten query for retrieval
+            logger.info(f"Searching course materials for: '{rewritten_query[:50]}...'")
+            context_data = self.generate_context(rewritten_query, user_id, course_id, document_id)
 
             # Check if we have relevant content based on similarity threshold
             avg_similarity = context_data.get('average_similarity', 0)
@@ -583,7 +636,7 @@ class RAGPipeline:
             # Use adaptive response engine to enhance prompt with personalization
             with db_manager.get_session() as session:
                 try:
-                    # Build base prompt with context
+                    # Build base prompt with context (use ORIGINAL query for user-facing prompts)
                     base_prompt = f"""You are an AI study assistant. Base your answer on the provided course materials.
 
 COURSE MATERIALS:
@@ -593,21 +646,16 @@ STUDENT QUESTION: {query}
 
 ANSWER:"""
 
-                    # Get conversation history from session manager
-                    from src.services.personalization_engine import session_manager
-                    conversation_history = session_manager.get_conversation_history(
-                        user_id=user_id,
-                        db_session=session,
-                        limit=3  # Last 3 conversation turns
-                    )
+                    # Reuse conversation_history from earlier (already retrieved)
+                    # No need to fetch again
 
                     # Enhance prompt with adaptive features (pass pre-extracted topics if available)
                     enhanced_prompt, metadata = adaptive_response_engine.analyze_and_enhance_prompt(
                         user_id=user_id,
-                        query=query,
+                        query=query,  # Use original query for personalization
                         base_prompt=base_prompt,
                         session=session,
-                        conversation_history=conversation_history,
+                        conversation_history=conversation_history,  # Reuse from earlier
                         pre_extracted_topics=pre_extracted_topics
                     )
 
@@ -622,11 +670,42 @@ ANSWER:"""
 
             # Generate response using LLM with enhanced prompt
             response = self.llm_service.generate_response(
-                query,
+                query,  # Use original query
                 context_data['context'],
                 user_preferences,
                 enhanced_prompt=enhanced_prompt  # Pass enhanced prompt
             )
+
+            # ENHANCEMENT: Extract topic from the generated response for better context tracking
+            # This provides much more accurate topic detection than query-based extraction alone
+            extracted_topic = None
+            try:
+                extracted_topic = self.query_rewriter.extract_topic_from_response(
+                    response=response,
+                    query=query,
+                    llm_service=self.llm_service
+                )
+
+                if extracted_topic:
+                    logger.info(f"📌 Topic extracted from response: '{extracted_topic}'")
+
+                    # Update session primary_topic if not set or if this is a significant new topic
+                    if conv_session and (not conv_session.primary_topic or len(query.split()) > 5):
+                        try:
+                            with db_manager.get_session() as update_session:
+                                session_to_update = update_session.query(ConversationSession).filter(
+                                    ConversationSession.id == conv_session.id
+                                ).first()
+
+                                if session_to_update:
+                                    session_to_update.primary_topic = extracted_topic
+                                    update_session.commit()
+                                    logger.debug(f"Updated session primary_topic to: '{extracted_topic}'")
+                        except Exception as update_error:
+                            logger.warning(f"Could not update session primary_topic: {update_error}")
+
+            except Exception as topic_error:
+                logger.warning(f"Could not extract topic from response: {topic_error}")
 
             # Enhance response with source information
             enhanced_response = self._enhance_response_with_sources(response, context_data)
@@ -638,7 +717,14 @@ ANSWER:"""
                 'chunks_retrieved': context_data['total_chunks'],
                 'chunks_used': context_data['used_chunks'],
                 'confidence': self._assess_response_confidence(context_data['sources']),
-                'average_similarity': context_data.get('average_similarity', 0)
+                'average_similarity': context_data.get('average_similarity', 0),
+                # Query rewriting metadata for debugging/metrics
+                'query_rewritten': rewrite_metadata['is_followup'],
+                'original_query': query if rewrite_metadata['is_followup'] else None,
+                'rewritten_query': rewritten_query if rewrite_metadata['is_followup'] else None,
+                'rewrite_context_source': rewrite_metadata.get('context_source'),
+                # NEW: Topic extraction metadata
+                'extracted_topic': extracted_topic
             }
 
         except Exception as e:
