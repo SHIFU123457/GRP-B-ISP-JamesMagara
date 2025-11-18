@@ -25,7 +25,7 @@ Study Helper Agent automates academic assistance by connecting to your Google Cl
 - [x] Interactive Notifications: Context-sensitive help buttons for assignments, quizzes, and readings
 - [x] User Profiles: Records and tracks preferences and interaction history
 - [x] Session engagement & Analytics: Keeps track of and monitors patterns for continuous improvement
-- [] Adaptive Responses: Tailors explanations based on learning style, response-length and difficulty preferences
+- [x] Adaptive Responses: Tailors explanations based on learning style, response-length and difficulty preferences
 
 ### Telegram Interface
 
@@ -83,3 +83,24 @@ The bot automatically notifies you about:
 - [] New announcements posted 
 
 Each notification includes contextual help buttons tailored to the material type.
+
+## Requirements
+### Python Version
+Python 3.9+ (recommended for compatibility with all dependencies)
+
+### Core Dependencies
+- [] python-telegram-bot (Telegram bot framework)
+- [] fastapi, uvicorn (OAuth server and web API)
+- [] sqlalchemy, psycopg2-binary, alembic (PostgreSQL ORM and migrations)
+- [] google-auth, google-auth-oauthlib, google-auth-httplib2, google-api-python-client (Google Classroom integration)
+- [] PyPDF2, PyMuPDF, python-docx, python-pptx, pdfplumber, mammoth (Document processing)
+- [] torch, transformers, sentence-transformers (AI/ML models and embeddings)
+- [] chromadb, faiss-cpu (Vector store and similarity search)
+- [] numpy, pandas, scikit-learn (Data processing and ML utilities)
+- [] nltk, spacy (Text processing and NLP)
+- [] requests, httpx, urllib3 (HTTP requests and API calls)
+- [] schedule (Task scheduling)
+- [] python-dotenv (Environment variable management)
+- [] huggingface_hub (Model downloads)
+- [] loguru (Logging)
+- [] redis (Development cache, optional)
