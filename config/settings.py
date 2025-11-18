@@ -40,7 +40,7 @@ class Settings:
     # RAG Pipeline Settings
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "300"))  # words per chunk (optimized)
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "75"))  # overlap words (increased)
-    TOP_K_RETRIEVAL: int = int(os.getenv("TOP_K_RETRIEVAL", "10"))  # chunks to retrieve (increased for comprehensive responses)
+    TOP_K_RETRIEVAL: int = int(os.getenv("TOP_K_RETRIEVAL", "20"))  # chunks to retrieve (increased for comprehensive responses)
     SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.25"))  # minimum similarity (lowered for better recall)
     CONTEXT_MAX_LENGTH: int = int(os.getenv("CONTEXT_MAX_LENGTH", "4000"))  # max context length for LLM (increased)
     HIGH_QUALITY_THRESHOLD: float = float(os.getenv("HIGH_QUALITY_THRESHOLD", "0.3"))  # threshold for quality filtering
